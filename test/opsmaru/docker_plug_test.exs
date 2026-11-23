@@ -1,0 +1,301 @@
+defmodule Opsmaru.Containers.Docker.PlugTest do
+  use ExUnit.Case, async: true
+
+  alias Elixir.Plug.{Conn, Test}
+  alias Opsmaru.Containers.{Context, Host, Transport}
+  alias Opsmaru.Containers.Docker.{Capabilities, Plug}
+  alias Opsmaru.Containers.Nested.Target
+  alias Opsmaru.Containers.Transport.Stream
+  alias Opsmaru.Incus
+
+  defmodule Policy do
+    @moduledoc false
+    @behaviour Host
+
+    @impl Host
+    def context(%{host_peer: {context, _decision}}), do: {:ok, context}
+
+    @impl Host
+    def authorize(_, %{host_peer: {_, {:sleep, milliseconds}}}) do
+      Process.sleep(milliseconds)
+      :allow
+    end
+
+    def authorize(_, %{host_peer: {_, :raise}}), do: raise("private policy error")
+    def authorize(_, %{host_peer: {_, decision}}), do: decision
+
+    @impl Host
+    def map_bind_source(_context, "/host/shared"), do: {:ok, "/engine/shared"}
+    def map_bind_source(_context, _), do: :deny
+  end
+
+  defmodule ScriptedEngine do
+    @moduledoc false
+    @behaviour Transport
+    @behaviour Stream
+
+    @impl Transport
+    def dial(_target, {observer, response}, _deadline) do
+      send(observer, :dialed)
+      {:ok, connection} = Agent.start_link(fn -> {observer, response, []} end)
+      {:ok, %Stream{adapter: __MODULE__, handle: connection}}
+    end
+
+    @impl Stream
+    def recv(connection, _limit, _deadline) do
+      Agent.get_and_update(connection, fn
+        {observer, [next | rest], sent} -> {{:ok, next}, {observer, rest, sent}}
+        state -> {:eof, state}
+      end)
+    end
+
+    @impl Stream
+    def send(connection, iodata, _deadline) do
+      Agent.update(connection, fn {observer, response, sent} ->
+        {observer, response, [iodata | sent]}
+      end)
+    end
+
+    @impl Stream
+    def shutdown_write(_, _), do: :ok
+
+    @impl Stream
+    def close(connection) do
+      {observer, _, sent} = Agent.get(connection, & &1)
+      send(observer, {:wire, IO.iodata_to_binary(Enum.reverse(sent))})
+      Agent.stop(connection)
+    end
+  end
+
+  test "preserves the encoded request target, repeated headers and chunked engine body" do
+    response = [
+      "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nApi-Version:\t1.57\r\n",
+      "Set-Cookie: name=a\r\nSet-Cookie: name=b\r\nConnection: x-private\r\nX-Private: hidden\r\n\r\n",
+      "2\r\nab\r\n3\r\nc",
+      "de\r\n0\r\nTrailer-One: value\r\n\r\n"
+    ]
+
+    conn = call("GET", "/v1.57/images/registry%2Frepo/json?filters=a%2Fb", engine(response))
+    assert %{status: 200, resp_headers: headers, resp_body: "abcde"} = conn
+    assert {"api-version", "1.57"} in headers
+    assert {"set-cookie", "name=a"} in headers
+    assert {"set-cookie", "name=b"} in headers
+    refute List.keymember?(headers, "x-private", 0)
+
+    assert_received :dialed
+
+    assert_received {:wire,
+                     "GET /v1.57/images/registry%2Frepo/json?filters=a%2Fb HTTP/1.1\r\n" <> _}
+
+    refute_received :dialed
+  end
+
+  test "stale capability snapshots and late or raised policy answers never dial" do
+    context = engine([])
+    stale = put_in(context.capabilities.expires_at, now() - 1)
+
+    assert response(call("GET", "/_ping", stale)) ==
+             {503, %{"message" => "Docker engine is not ready"}}
+
+    for decision <- [:deny, :raise, {:sleep, 100}] do
+      conn = call("GET", "/_ping", context, "", decision, admission_timeout: 40)
+      assert response(conn) == {403, %{"message" => "request denied"}}
+    end
+
+    refute_received :dialed
+  end
+
+  test "negotiates the engine range without dialing and caps unversioned requests" do
+    data = ~s({"ApiVersion":"1.60","MinAPIVersion":"1.45","Os":"linux"})
+    context = engine(fixed_response(200, data, [{"api-version", "1.60"}]), "1.45", "1.60")
+
+    for {request, fragment} <- [
+          {"/v1.44/version", "Minimum supported API version is 1.45"},
+          {"/v1.58/version", "Maximum supported API version is 1.57"}
+        ] do
+      assert {400, %{"message" => message}} = response(call("GET", request, context))
+      assert message =~ fragment
+    end
+
+    refute_received :dialed
+
+    conn = call("GET", "/version", context)
+    assert [version] = Conn.get_resp_header(conn, "api-version")
+    assert version == "1.57"
+
+    assert response(conn) ==
+             {200, %{"ApiVersion" => "1.57", "MinAPIVersion" => "1.45", "Os" => "linux"}}
+
+    assert_received {:wire, "GET /v1.57/version HTTP/1.1\r\n" <> _}
+  end
+
+  test "distinguishes unknown, unsupported and version-gated routes before dialing" do
+    context = engine([])
+
+    assert {404, %{"message" => "page not found"}} = response(call("GET", "/no-route", context))
+    assert {501, %{"message" => "/swarm:" <> _}} = response(call("GET", "/swarm", context))
+
+    assert {404, %{"message" => "page not found"}} =
+             response(call("GET", "/v1.54/images/demo/attestations", context))
+
+    refute_received :dialed
+  end
+
+  test "HEAD ping preserves the negotiated header and sends no body" do
+    context = engine(["HTTP/1.1 200 OK\r\nApi-Version: 1.57\r\nContent-Length: 2\r\n\r\n"])
+    conn = call("HEAD", "/_ping", context)
+    assert %{status: 200, resp_body: ""} = conn
+    assert Conn.get_resp_header(conn, "api-version") == ["1.57"]
+    assert_received {:wire, "HEAD /_ping HTTP/1.1\r\n" <> _}
+  end
+
+  test "maps both container bind forms and preserves ordinary volume bodies" do
+    body =
+      ~s({"Image":"demo","HostConfig":{"Binds":["/host/shared:/src:ro"],"Mounts":[{"Type":"bind","Source":"/host/shared","Target":"/dest"}]}})
+
+    context = engine(fixed_response(201, "{}"))
+
+    assert {201, %{}} = response(call("POST", "/containers/create", context, body))
+    assert_received {:wire, wire}
+
+    assert Jason.decode!(body_of(wire)) == %{
+             "Image" => "demo",
+             "HostConfig" => %{
+               "Binds" => ["/engine/shared:/src:ro"],
+               "Mounts" => [
+                 %{"Type" => "bind", "Source" => "/engine/shared", "Target" => "/dest"}
+               ]
+             }
+           }
+
+    original = ~s( {"Name":"data", "DriverOpts":{} } )
+    assert {201, %{}} = response(call("POST", "/volumes/create", context, original))
+    assert_received {:wire, volume_wire}
+    assert body_of(volume_wire) == original
+  end
+
+  test "refuses denied binds, ambiguous fields and custom volume driver options before dialing" do
+    context = engine([])
+
+    for {path, body} <- [
+          {"/containers/create", ~s({"HostConfig":{"Binds":["/denied:/work"]}})},
+          {"/containers/create", ~s({"HostConfig":{},"hostconfig":{"Binds":["/denied:/work"]}})},
+          {"/volumes/create", ~s({"DriverOpts":{"type":"none","o":"bind"}})},
+          {"/containers/create",
+           ~s({"HostConfig":{"Mounts":[{"Type":"volume","VolumeOptions":{"DriverConfig":{"Options":{"o":"bind"}}}}]}})}
+        ] do
+      assert {400, %{"message" => _}} = response(call("POST", path, context, body))
+    end
+
+    refute_received :dialed
+  end
+
+  test "an upstream disconnect after a mutation attempt is reported without replay" do
+    conn = call("POST", "/containers/create", engine([]), ~s({"Image":"fixture"}))
+    assert {502, %{"message" => "Docker engine connection failed"}} = response(conn)
+    assert_received :dialed
+    assert_received {:wire, wire}
+    assert wire =~ "POST /containers/create "
+    assert body_of(wire) == ~s({"Image":"fixture"})
+    refute_received :dialed
+  end
+
+  test "streams a large request in chunks and does not replay it" do
+    body = :binary.copy(<<42>>, 140_000)
+    context = engine(fixed_response(200, "{}"))
+    assert {200, %{}} = response(call("POST", "/images/load", context, body))
+    assert_received :dialed
+    assert_received {:wire, wire}
+    refute_received :dialed
+    assert wire =~ "transfer-encoding: chunked\r\n"
+    assert body_of(wire) |> count_payload(0) == byte_size(body)
+  end
+
+  test "a truncated stream aborts the committed response and closes the dial" do
+    response = ["HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nab"]
+    context = engine(response)
+
+    assert_raise RuntimeError, "Docker upstream response ended before completion", fn ->
+      call("GET", "/containers/engine/logs?follow=true", context)
+    end
+
+    assert_received {:wire, "GET /containers/engine/logs?follow=true HTTP/1.1\r\n" <> _}
+    refute_received {:wire, _}
+  end
+
+  test "streams Docker progress, stats and events without changing their records" do
+    response = [
+      "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n",
+      "3\r\n{}\n\r\n",
+      "3\r\n[]\n\r\n0\r\n\r\n"
+    ]
+
+    for {verb, path} <- [
+          {"GET", "/events"},
+          {"GET", "/containers/engine/stats"},
+          {"POST", "/build"},
+          {"POST", "/images/create"},
+          {"POST", "/images/fixture/push"}
+        ] do
+      assert %{status: 200, resp_body: "{}\n[]\n"} = call(verb, path, engine(response))
+      assert_received {:wire, _}
+    end
+  end
+
+  defp count_payload("0\r\n\r\n", total), do: total
+
+  defp count_payload(chunks, total) do
+    [hex_length, data] = :binary.split(chunks, "\r\n")
+    length = String.to_integer(hex_length, 16)
+    assert length <= 65_536
+    <<bytes::binary-size(length), "\r\n", rest::binary>> = data
+    assert bytes == :binary.copy(<<42>>, length)
+    count_payload(rest, total + length)
+  end
+
+  defp call(method, path, context, body \\ "", decision \\ :allow, options \\ []) do
+    method
+    |> Test.conn(path, body)
+    |> Conn.put_private(:opsmaru_containers_peer, {context, decision})
+    |> Plug.call(Plug.init(Keyword.put(options, :host, Policy)))
+  end
+
+  defp engine(response, minimum \\ "1.40", maximum \\ "1.57") do
+    client = %Incus{
+      connection: Incus.Connection.unix!("/unused", owner: :fixture, project: "fixtures"),
+      context: Incus.Context.new!(owner: :fixture, identity: :host, ready?: fn -> true end),
+      server: nil
+    }
+
+    target = %Target{client: client, instance: "engine"}
+
+    %Context{
+      identity: :verified_peer,
+      dialer: {ScriptedEngine, {self(), response}},
+      target: target,
+      ready?: true,
+      capabilities: %Capabilities{
+        target: target,
+        minimum: minimum,
+        maximum: maximum,
+        expires_at: now() + 5_000
+      }
+    }
+  end
+
+  defp fixed_response(status, body, headers \\ []) do
+    headers = Enum.map_join(headers, "", fn {name, value} -> "#{name}: #{value}\r\n" end)
+    ["HTTP/1.1 #{status} Fixture\r\nContent-Length: #{byte_size(body)}\r\n#{headers}\r\n#{body}"]
+  end
+
+  defp response(conn) do
+    {conn.status, Jason.decode!(conn.resp_body)}
+  end
+
+  defp body_of(wire) do
+    [_, body] = :binary.split(wire, "\r\n\r\n")
+    body
+  end
+
+  defp now, do: System.monotonic_time(:millisecond)
+end
