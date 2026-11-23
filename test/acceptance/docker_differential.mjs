@@ -24,12 +24,24 @@ assert.equal(version.status, 200);
 assert.equal(version.body.Version, "29.10.0");
 assert.equal(version.body.ApiVersion, "1.57");
 assert.deepEqual(await get(relay, "GET", "/version"), version, "GET /version");
+console.log("Passed GET /version");
 
 for (const [method, path] of scopedPaths) {
-  const expected = await get(direct, method, path);
+  const expected = normalize(path, await get(direct, method, path));
   assert.equal(expected.status, 200, `${method} ${path} direct status`);
-  assert.deepEqual(await get(relay, method, path), expected, `${method} ${path}`);
+  const actual = normalize(path, await get(relay, method, path));
+  assert.deepEqual(actual, expected, `${method} ${path}`);
   console.log(`Passed ${method} ${path}`);
+}
+
+function normalize(path, response) {
+  if (path !== "/v1.57/networks" || response.status !== 200) return response;
+
+  // The pinned daemon can enumerate the same networks in a different order.
+  assert(Array.isArray(response.body), "Expected a network list");
+  const ids = response.body.map((network) => network.Id);
+  assert(ids.every((id) => typeof id === "string") && new Set(ids).size === ids.length);
+  return { ...response, body: response.body.toSorted((a, b) => a.Id.localeCompare(b.Id)) };
 }
 
 function socketPath(key) {

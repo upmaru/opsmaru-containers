@@ -36,7 +36,12 @@ cleanup() {
 }
 
 mkdir "$workspace/config" "$workspace/context"
-node -e 'process.stdout.write(JSON.stringify({cliPluginsExtraDirs: [process.argv[1]]}))' \
+# An explicit empty auth entry keeps the disposable public-image check
+# anonymous and prevents discovery of the host credential helper.
+node -e 'process.stdout.write(JSON.stringify({
+  cliPluginsExtraDirs: [process.argv[1]],
+  auths: {"https://index.docker.io/v1/": {}}
+}))' \
   "$plugins" > "$workspace/config/config.json"
 trap 'rm -rf "$workspace"' EXIT
 

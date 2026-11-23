@@ -86,6 +86,13 @@ Exec needs only the connection the host already has, and behaves the same for Ma
 
 The transport is a behaviour. The host-supplied dialer is the baseline during fixture implementation and remains the supported path if Incus exec fails qualification. The library still never dials anything the host did not supply.
 
+The [2026-11-23 live run](../../../docs/docker-live-acceptance.md) exercised
+the candidate through an authenticated Incus 7.0.1 gateway. The pinned stdio
+helper closed both directions after receiving peer output EOF. The run also
+observed a partial large upload and BuildKit teardown errors. Host-supplied
+dialers remain the supported transport. The differential and pinned CLI
+results apply to the tested workflows.
+
 ### 7. Relay, do not interpret
 
 For `nested` routes the handler forwards method, path, query, headers and body, and returns status, headers and body as the engine sent them. It handles hop-by-hop headers, transfer framing, version caps and mapped bind sources as specified. Preserve end-to-end headers, including repeated values. The relay carries the negotiated upgrade headers across the handshake and preserves raw bytes already read by either side. Hijacked and upgraded connections (`attach`, `exec/start`, `/session`, `/grpc`) are relayed in both directions with half-close preserved.

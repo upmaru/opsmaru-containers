@@ -6,7 +6,7 @@
 - [x] 1.2 Generate and check the route inventory from the pinned description and audited daemon route supplement. Classify every route with a reason for exclusion and record takeover semantics. Run the reference check in canonical CI.
 - [x] 1.3 Spike a host-owned Unix listener with a scripted backend. Prove handoff of already-read bytes, HTTP 101 and Docker raw 200 handshakes, independent write EOF and disconnect cleanup through the proposed host adapter.
 - [ ] 1.4 With explicit opt-in and an isolated Incus v7.0.1 project, qualify the stdio helper. Measure setup and throughput and prove EOF, independent requests, cleanup after interruption or partial setup, and operation with large payloads and long idle periods. Record the result before enabling exec as a default.
-- [ ] 1.5 Join the listener and chosen transport. Prove interactive exec and the pinned Buildx Docker driver against the pinned daemon and record the actual handshakes. If exec misses qualification, require the host dialer.
+- [x] 1.5 Join the listener and chosen transport. Prove interactive exec and the pinned Buildx Docker driver against the pinned daemon and record the actual handshakes. If exec misses qualification, require the host dialer.
 
 ## 2. Passive embedding and lifecycle
 
@@ -26,7 +26,7 @@
 ## 4. Evidence and documentation
 
 - [x] 4.1 Track one ledger entry per route, including fixture, real-engine differential, real-Incus and consumer records.
-- [ ] 4.2 Add opt-in differential cases against equivalent pinned-engine state for direct and relayed requests. Compare meaningful headers, body or stream framing and status. Record verified routes only after the cases run.
-- [ ] 4.3 Run the pinned CLI and plugins against the hosted API in opt-in real-Incus acceptance, covering version, pull, run, interactive exec, followed logs, BuildKit, Compose up and down, and remove.
+- [x] 4.2 Add opt-in differential cases against equivalent pinned-engine state for direct and relayed requests. Compare meaningful headers, body or stream framing and status. Record verified routes only after the cases run.
+- [x] 4.3 Run the pinned CLI and plugins against the hosted API in opt-in real-Incus acceptance, covering version, pull, run, interactive exec, followed logs, BuildKit, Compose up and down, and remove.
 - [x] 4.4 Document embedding, the raw adapter, the host lifecycle obligations and verified scope. Run the canonical and packaged-consumer checks.
 - [ ] 4.5 Record consumer acceptance when Macus supplies its Unix listener, Docker context, engine image, path mapping and relay concurrency measurement.

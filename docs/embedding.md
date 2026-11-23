@@ -24,7 +24,9 @@ Implement `Opsmaru.Containers.Transport` to open an independent connection
 to dockerd on the host's private transport. Its `Transport.Stream` adapter
 supports one concurrent reader and writer, independent write EOF, bounded
 reads and explicit closure. The owner of the request defines the lifetime of
-that connection. Qualification of Incus exec as a default is pending.
+that connection. The
+[live acceptance report](docker-live-acceptance.md) records the qualification
+results for the candidate Incus exec transport.
 
 ## Mount ordinary HTTP and raw streams
 
