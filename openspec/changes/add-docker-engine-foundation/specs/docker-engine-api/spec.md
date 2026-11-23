@@ -4,7 +4,7 @@
 
 ### Requirement: Host-mounted handler
 
-The Docker Engine API SHALL be provided as a Plug that the host mounts on a listener the host owns. The library SHALL NOT create the socket, set its permissions, register a docker context or supervise the listener.
+Ordinary HTTP SHALL be handled by a Plug mounted on a host-owned listener. Hijacks SHALL use a host-mounted raw HTTP/1.1 adapter and share ordinary HTTP admission and route classification. The library SHALL NOT create the socket, set its permissions, register a docker context or supervise the listener.
 
 #### Scenario: Unmodified CLI on the host's socket
 
@@ -13,7 +13,7 @@ The Docker Engine API SHALL be provided as a Plug that the host mounts on a list
 
 ### Requirement: Pinned engine reference
 
-The library SHALL pin one Docker Engine release as its reference and record the release, its source commit, its minimum and maximum API versions and the SHA-256 of its API description. The route inventory SHALL be generated from that description, and a check SHALL fail when the inventory and the description differ.
+The library SHALL pin one Docker Engine release as its reference and record the release, its source commit, its minimum and maximum API versions and the SHA-256 of its API description. The route inventory SHALL be generated from that description and a supplement reconciled against the pinned daemon's registered routes and the pinned CLI, Compose and Buildx behavior. A check SHALL reject mismatches in the pinned inputs and generated inventory.
 
 #### Scenario: Reference description changes
 
@@ -22,12 +22,17 @@ The library SHALL pin one Docker Engine release as its reference and record the 
 
 ### Requirement: Version negotiation
 
-The handler SHALL answer `GET` and `HEAD /_ping` with the advertised API version headers as the reference engine does, and SHALL accept both unversioned paths and paths prefixed with a supported `/v{version}`. The advertised maximum SHALL be the lower of the reference's maximum and the nested engine's. A request for a version above the maximum or below the minimum SHALL be refused with status 400 and the reference engine's message, before the engine is contacted.
+The handler SHALL answer `GET` and `HEAD /_ping` with the advertised API version headers as the reference engine does, and SHALL accept both unversioned paths and paths prefixed with a supported `/v{version}`. The effective API range SHALL be the intersection of the reference and the engine range supplied in the host snapshot. The API headers and `/version` fields SHALL agree on the effective bounds. Unversioned requests SHALL use the effective maximum if the engine default is higher. Missing, expired or incompatible capability snapshots SHALL yield 503 before backend access. A request for a version above the maximum or below the minimum SHALL be refused with status 400 and the reference engine's message, before the engine is contacted.
 
 #### Scenario: Client newer than the engine
 
 - **WHEN** a client requests a path with an API version above the advertised maximum
 - **THEN** the handler answers 400 with the engine's too-new message and no engine request is made
+
+#### Scenario: Engine range above the reference floor
+
+- **WHEN** the host snapshot reports an engine minimum above the reference minimum and a client requests a version below the engine minimum
+- **THEN** the handler answers 400 using the effective minimum and makes no backend request
 
 #### Scenario: Older supported client
 
@@ -36,7 +41,7 @@ The handler SHALL answer `GET` and `HEAD /_ping` with the advertised API version
 
 ### Requirement: Engine error shape
 
-Every error the handler produces itself SHALL be a JSON object with a single `message` string and the status code the reference engine uses for that condition. Messages SHALL NOT contain credentials, registry tokens or Incus connection details.
+Every error the handler produces itself SHALL be a JSON object with a single `message` string and the reference engine's status for version and routing errors. Local policy, unsupported, upstream and readiness errors SHALL use their specified gateway status codes. Messages SHALL NOT contain credentials, registry tokens or Incus connection details.
 
 #### Scenario: Unknown path
 
@@ -73,7 +78,7 @@ Every method and path in the route inventory SHALL have exactly one class: `nest
 
 ### Requirement: Streaming and hijacked connections
 
-Hijacked and upgraded connections (container attach, exec start, the BuildKit session and gRPC routes) SHALL be relayed in both directions without reframing, preserving half-close in each direction. Long-lived responses (logs with follow, events, stats, build, pull and push progress) SHALL be relayed as they arrive, without buffering the whole response. Each client request SHALL use its own engine connection for its whole life, and the relay SHALL apply backpressure with a bounded buffer.
+Hijacked and upgraded connections (container attach, exec start, the BuildKit session and gRPC routes) SHALL be relayed in both directions without reframing, preserving already-read bytes, half-close in each direction supported by the qualified transport, and the pinned daemon's upgrade or raw response status. Long-lived responses (logs with follow, events, stats, build, pull and push progress) SHALL be relayed as they arrive, without buffering the whole response. Each client request SHALL use its own engine connection for its whole life, and the relay SHALL apply backpressure with a bounded buffer.
 
 #### Scenario: Interactive exec
 
@@ -92,7 +97,7 @@ Hijacked and upgraded connections (container attach, exec start, the BuildKit se
 
 ### Requirement: No replay of possibly accepted mutations
 
-When the engine connection fails after any byte of a request other than GET or HEAD was sent, the handler SHALL return an error to the client and SHALL NOT send the request again.
+The relay SHALL submit a request at most once. An engine connection failure after submission starts SHALL be reported with a Docker-shaped 502 while a downstream response can still be sent. After the response is committed the relay SHALL terminate the stream.
 
 #### Scenario: Connection lost during container create
 
@@ -101,7 +106,7 @@ When the engine connection fails after any byte of a request other than GET or H
 
 ### Requirement: Bind mount source decisions
 
-For `POST /containers/create`, the handler SHALL extract every bind mount source from `HostConfig.Binds` and from `HostConfig.Mounts` entries of type `bind`, and SHALL ask the host to map each one to a path inside the engine instance. A mapped source SHALL replace the original in the relayed body, with the rest of the body unchanged. When the host denies a source, or supplies no mapping callback, the create SHALL be refused with status 400 and the engine error shape naming the source, before the engine is contacted. Named volumes and tmpfs mounts SHALL be relayed unchanged.
+For `POST /containers/create`, the handler SHALL extract every bind mount source from `HostConfig.Binds` and from `HostConfig.Mounts` entries of type `bind`, and SHALL ask the host to map each one to a path inside the engine instance. A mapped source SHALL replace the original in the relayed body, with the rest of the body unchanged. When the host denies a source, or supplies no mapping callback, the create SHALL be refused with status 400 and the engine error shape naming the source, before the engine is contacted. Ordinary named volumes and tmpfs mounts SHALL be relayed unchanged. Requests creating volumes with custom driver options, including inline mounts and local-driver bind options, SHALL be refused with status 400 before backend access.
 
 #### Scenario: Host maps a source
 
@@ -117,6 +122,11 @@ For `POST /containers/create`, the handler SHALL extract every bind mount source
 
 - **WHEN** a create mounts only a named volume
 - **THEN** the body is relayed unchanged and the mapping callback is not called
+
+#### Scenario: Local driver bind options
+
+- **WHEN** a client requests creation of a local-driver volume with custom mount options
+- **THEN** the handler answers 400 and the engine receives nothing
 
 ### Requirement: Engine not ready
 

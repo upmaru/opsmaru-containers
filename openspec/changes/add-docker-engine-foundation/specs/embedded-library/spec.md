@@ -18,7 +18,7 @@ The library SHALL have no application callback. Loading or starting the `:opsmar
 
 ### Requirement: Explicit host context
 
-Every operation and every handled request SHALL obtain its Incus connection, its `opsmaru_incus` host context and its engine instance reference from the host. The library SHALL NOT hold a global or default connection. When the host supplies no context, refuses, or reports the backend as not ready, the library SHALL fail before any backend access.
+Every operation and every handled request SHALL obtain its Incus connection, its `opsmaru_incus` host context, verified identity and its engine instance reference from the host. The library SHALL NOT hold a global or default connection. When the host supplies no context, refuses, or reports the backend as not ready, the library SHALL fail before any backend access. For Docker HTTP requests, the host SHALL supply readiness and an API capability snapshot bound to the selected target and an expiry, without probing the backend during admission.
 
 #### Scenario: Host refuses a context
 
@@ -50,7 +50,7 @@ The library SHALL keep no database, file or long-lived in-memory record of engin
 
 ### Requirement: Optional web dependencies
 
-`plug` and `cowboy` SHALL be optional dependencies. A consumer that does not depend on them SHALL compile the library and use the nested engine lifecycle operations; the Plug handler modules SHALL be absent.
+`plug` and `cowboy` SHALL be optional dependencies. A consumer without the web stack SHALL compile and use the nested engine lifecycle operations. Modules that require an absent optional dependency SHALL be absent. The Hex package SHALL include the Docker reference, route inventory, evidence ledger and upstream notices.
 
 #### Scenario: Consumer without a web stack
 

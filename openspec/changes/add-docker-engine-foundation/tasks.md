@@ -1,43 +1,32 @@
 # Tasks
 
-## 1. Reference and transport spike
+## 1. Pinned reference and transport qualification
 
-- [ ] 1.1 Choose the Docker Engine release to pin. Record the release, source commit, minimum and maximum API versions and the SHA-256 of its API description in `priv/docker/reference.json`, with the upstream licence notice in `priv/notices`. Pin the matching `docker` CLI for acceptance.
-- [ ] 1.2 Spike the default transport against a real Incus v7.0.1 and the pinned dockerd: run the engine's stdio dial helper over a non-interactive `opsmaru_incus` exec and confirm a plain request, half-close in both directions, an interactive exec, a followed log stream and a BuildKit build through `/session` and `/grpc`. Measure connection setup time and throughput. Record the result in `design.md`; if half-close or the BuildKit upgrade fails, revise decision 6 before continuing.
-- [ ] 1.3 Generate `priv/docker/routes.json` from the pinned API description with a Mix task that has a `--check` mode, and add `mise run check:reference`.
+- [ ] 1.1 Record Docker Engine and CLI 29.10.0, Compose 5.8.0 and Buildx 0.39.1 for the Docker builder driver. Record source commits, API bounds and the SHA-256 and license of the pinned OpenAPI description.
+- [ ] 1.2 Generate and check the route inventory from the pinned description and audited daemon route supplement. Classify every route with a reason for exclusion and record takeover semantics. Run the reference check in canonical CI.
+- [ ] 1.3 Spike a host-owned Unix listener with a scripted backend. Prove handoff of already-read bytes, HTTP 101 and Docker raw 200 handshakes, independent write EOF and disconnect cleanup through the proposed host adapter.
+- [ ] 1.4 With explicit opt-in and an isolated Incus v7.0.1 project, qualify the stdio helper. Measure setup and throughput and prove EOF, independent requests, cleanup after interruption or partial setup, and operation with large payloads and long idle periods. Record the result before enabling exec as a default.
+- [ ] 1.5 Join the listener and chosen transport. Prove interactive exec and the pinned Buildx Docker driver against the pinned daemon and record the actual handshakes. If exec misses qualification, require the host dialer.
 
-## 2. Embedding contract
+## 2. Passive embedding and lifecycle
 
-- [ ] 2.1 Add `Opsmaru.Containers.Host` with `context/1`, `authorize/2` and the optional `map_bind_source/2`, and the context struct carrying the Incus connection, the `opsmaru_incus` host context and the engine instance reference. Verify that a missing, refused or not-ready context fails before any backend access.
-- [ ] 2.2 Add `jason`, and `plug` and `cowboy` as optional dependencies. Verify that the library compiles without them and that the handler modules are then absent.
-- [ ] 2.3 Add `mise run check:consumer`: build the Hex package and verify it in two fresh consumers, one without a web stack and one mounting the handler, with hostile `PHX_SERVER` and `PORT` settings.
+- [ ] 2.1 Add the host contract, request context and expiring engine capability snapshot. Denial, invalid context, and absent or expired readiness fail before backend access. Keep verified identity and target selection host-owned.
+- [ ] 2.2 Add a host-supplied dialer contract and scripted transport fixtures for independent bounded duplex connections. Enable an exec implementation only following task 1.4.
+- [ ] 2.3 Add the validated nested engine specification and explicit `ensure/3`. Verify ownership, project selection, definite create conflict reconciliation, successful repeat calls, bounded waits and no replay after an unknown create or start outcome.
+- [ ] 2.4 Implement readiness by checking running state, ping and API range, returning observed capabilities to the host for publication.
+- [ ] 2.5 Add direct JSON and optional web dependencies. Check the built Hex package in two fresh consumers, one with the web stack and one without, with hostile `PHX_SERVER` and `PORT` settings. Verify reference data and notices are packaged.
 
-## 3. Nested engine
+## 3. HTTP and raw relay
 
-- [ ] 3.1 Add the engine specification and its validation: required nesting key and marker, rejection of conflicting configuration, no image default.
-- [ ] 3.2 Add `Opsmaru.Containers.Nested.ensure/3`, `stop/3` and `remove/3`. Verify idempotence for a ready engine, one instance under concurrent callers, the conflict error for an unmarked instance of the same name, and that an interrupted create or start is reported as uncertain and never repeated.
-- [ ] 3.3 Add the transport behaviour, the default exec transport and support for a host dialer. Verify one exec operation per engine connection, half-close in both directions, and that the exec operation ends and its channels close when either side goes away.
-- [ ] 3.4 Add the readiness check: instance running, engine ping through the transport, and API range covering the reference minimum, with distinct not-ready and incompatible errors.
+- [ ] 3.1 Implement shared route admission, authorization and Docker-shaped rejections before any backend access. Use the effective version range for negotiation, preserve encoded targets, and reconcile ping, version reporting and unversioned paths.
+- [ ] 3.2 Gate container bind sources with the host path callback. Reject custom volume-driver options on explicit and inline volume creation. Preserve pass-through bodies requiring no rewrite.
+- [ ] 3.3 Relay ordinary HTTP with bounded request and response streaming, repeated end-to-end headers and one dial per forwarded request. Verify honest upstream failure before commitment and connection termination after commitment. Verify no request replay.
+- [ ] 3.4 Implement the host-mounted raw adapter against the handoffs qualified in task 1.3. Verify attach, exec, logs, events, stats and build progress including client disconnect and stalled-reader independence.
 
-## 4. Docker Engine API handler
+## 4. Evidence and documentation
 
-- [ ] 4.1 Add the Plug handler with the route table, `/_ping`, versioned and unversioned paths, the advertised maximum (the lower of reference and engine) and refusal of out-of-range versions with the reference engine's messages.
-- [ ] 4.2 Add the engine error shape for every handler-made error (400, 403, 404, 501, 503) and verify that no message contains credentials, registry tokens or connection details.
-- [ ] 4.3 Call `authorize/2` with the classified request before any backend access. Verify that denial, a missing callback, a raising callback and a late answer all answer 403 with no backend request.
-- [ ] 4.4 Classify every inventory route as `nested` or `unsupported` with a reason, and make the reference check fail on an unclassified route or on any `native` class.
-- [ ] 4.5 Relay plain requests and responses unchanged apart from hop-by-hop headers, one engine connection per request, with bounded buffering and backpressure. Verify that a failure after request bytes were sent on a non-GET/HEAD request is returned to the client and never retried.
-- [ ] 4.6 Relay hijacked and upgraded connections (attach, exec start, `/session`, `/grpc`) and long-lived responses (followed logs, events, stats, build, pull and push progress). Verify half-close, client disconnect cleanup, and that a stalled stream does not delay a concurrent short request.
-- [ ] 4.7 Extract bind sources from `HostConfig.Binds` and bind-type `HostConfig.Mounts` on container create, apply `map_bind_source/2`, and refuse with 400 when a source is denied or no callback exists. Verify that named volumes and tmpfs mounts pass unchanged and that only the mapped sources differ in the relayed body.
-- [ ] 4.8 Answer 503 when the engine is absent, stopped, not ready or incompatible, and verify that the handler never creates or starts the instance.
-
-## 5. Evidence
-
-- [ ] 5.1 Add `priv/docker/coverage.json` with one entry per inventory route (class, fixture, differential, consumer) and a check that it matches the inventory and never counts nested evidence for a native class.
-- [ ] 5.2 Add the opt-in differential suite: against an isolated Incus project with the pinned engine, send each `nested` route's request directly and through the handler and compare status and body. Record results in the ledger.
-- [ ] 5.3 Add the opt-in CLI acceptance with the unmodified pinned `docker` CLI through the handler: `version`, `pull`, `run`, interactive `exec`, `logs -f`, `build` with BuildKit, `compose up` and `down`, and `rm`.
-
-## 6. Documentation and release readiness
-
-- [ ] 6.1 Write `docs/embedding.md` (host behaviour, context, mounting the handler, engine specification and ensure) and `docs/docker-engine-api.md` (route classes, unsupported routes with reasons, bind mounts, published ports reachable only inside the engine instance, the single trust domain).
-- [ ] 6.2 Update `README.md`, `AGENTS.md` and `CHANGELOG.md`, add the Hex publish workflow, and run `mise run check`, `mise run check:reference` and `mise run check:consumer`.
-- [ ] 6.3 Hand over to Macus for consumer acceptance: its socket, docker context, engine image, path mapping and a measurement of concurrent streams over its guest relay. Record the result as consumer evidence; this library does not claim it.
+- [ ] 4.1 Track one ledger entry per route, including fixture, real-engine differential, real-Incus and consumer records.
+- [ ] 4.2 Add opt-in differential cases against equivalent pinned-engine state for direct and relayed requests. Compare meaningful headers, body or stream framing and status. Record verified routes only after the cases run.
+- [ ] 4.3 Run the pinned CLI and plugins against the hosted API in opt-in real-Incus acceptance, covering version, pull, run, interactive exec, followed logs, BuildKit, Compose up and down, and remove.
+- [ ] 4.4 Document embedding, the raw adapter, the host lifecycle obligations and verified scope. Run the canonical and packaged-consumer checks.
+- [ ] 4.5 Record consumer acceptance when Macus supplies its Unix listener, Docker context, engine image, path mapping and relay concurrency measurement.
