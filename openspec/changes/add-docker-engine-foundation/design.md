@@ -1,0 +1,136 @@
+# Design
+
+## Context
+
+See [proposal.md](proposal.md). The library sits between a container engine client and Incus:
+
+```
+docker CLI / compose / testcontainers
+        │  Docker Engine API, on a listener the host owns
+        ▼
+opsmaru_containers
+  ├─ Docker   Plug handler: negotiation, errors, authorization, route table
+  ├─ Core     host context, bind-path decisions, relay
+  └─ Nested   engine instance: ensure, readiness, transport
+        │  opsmaru_incus only
+        ▼
+Incus ── system container running dockerd
+```
+
+`opsmaru_incus` already provides what this change needs from Incus: typed instance create, start and state calls, and native exec channels (`Opsmaru.Incus.Session.exec/3`). It is pinned to Incus v7.0.1.
+
+Two facts shape the design. First, Macus reaches Incus in its guest over a relay where one busy stream has stalled others (head-of-line blocking), so long-lived Docker streams must not share a connection. Second, the library has the same embedding rules as `opsmaru_incus`: it starts nothing and holds nothing.
+
+## Goals / Non-Goals
+
+**Goals:** a Docker socket that works with the unmodified `docker` CLI for every route the pinned reference defines; no code path that reaches Incus except through `opsmaru_incus` and the host's connection; a route table and evidence ledger that later changes can extend one route at a time; identical behavior for Macus and for a remote Incus target.
+
+**Non-Goals:** the native engine, a shared image store, libpod, published-port forwarding, engine installation inside the instance, rootless or multi-tenant isolation between Docker clients, and any Macus code.
+
+## Decisions
+
+### 1. One package, role-named, with per-API frontends
+
+The package is `opsmaru_containers` and the namespace is `Opsmaru.Containers`. The Docker frontend lives under `Opsmaru.Containers.Docker`. A later libpod frontend would sit beside it and share the core. Naming the package for a vendor or for OCI would describe only part of it.
+
+### 2. The host owns the listener and decides every request
+
+The library exposes a Plug that the host mounts. The host chooses the socket, its file permissions and its supervisor. `plug` and `cowboy` are optional dependencies, so a host that uses only the nested lifecycle operations compiles without a web stack.
+
+The Docker socket grants root-equivalent control of the engine, and the API itself has no authentication. So the handler calls a host behaviour, `Opsmaru.Containers.Host`, before any backend access:
+
+- `context/1` returns the Incus connection, the `opsmaru_incus` host context and the engine instance reference for this request, or refuses.
+- `authorize/2` allows or denies the classified request. A missing, failing or late answer denies.
+- `map_bind_source/2` (optional) maps or denies one bind mount source path.
+
+This follows the gateway's host behaviour in `opsmaru_incus`: the library classifies, the host decides.
+
+### 3. A pinned Docker Engine reference
+
+The library pins one Docker Engine release and records it in `priv/docker/reference.json`: the release, its source commit, its maximum and minimum API versions and the SHA-256 of its published API description. `priv/docker/routes.json` is generated from that description and lists every method and path.
+
+The release is chosen in task 1.1, not here. The handler advertises the reference's maximum API version, or the nested engine's if that is lower, and refuses versions outside the supported range with the engine's own message.
+
+### 4. A route table with exactly one class per route
+
+Each route in `routes.json` has one class:
+
+| Class | Meaning in this change |
+|---|---|
+| `nested` | Relayed to the nested engine |
+| `unsupported` | Refused with the engine error shape and a reason |
+| `native` | Reserved for later changes; no route uses it yet |
+
+A route missing from the table fails the reference check, so a new reference release cannot add routes silently. A request that matches no route gets the engine's `page not found` error. Swarm, plugin and other routes that make no sense for a single nested engine may be classified `unsupported`; each needs a recorded reason.
+
+### 5. The nested engine is a marked Incus instance from a host specification
+
+The host supplies a specification: instance name, project, image source, profiles, and extra config and devices. The library adds what the engine needs (`security.nesting=true`) and the marker `user.opsmaru.containers.role=engine`. It does not choose a distribution or install packages; the image must already run dockerd. Macus has an appliance image pipeline for that, and central Opsmaru can use its own.
+
+`Opsmaru.Containers.Nested.ensure/3` is explicit and idempotent: create if absent, start if stopped, then wait for readiness. The Plug never calls it. When the engine is not ready, the handler answers 503 with the engine error shape, and the host decides whether to ensure on first use or at boot.
+
+An existing instance with the same name but without the marker is never adopted or changed. Creation whose outcome is unknown is reported as uncertain and not retried, as `opsmaru_incus` reports it.
+
+### 6. Reach the engine through Incus exec by default
+
+The engine listens on a Unix socket inside the instance. The default transport runs `docker system dial-stdio` in the instance through a non-interactive Incus exec and treats its stdin and stdout channels as one byte stream to the engine. This is the helper the Docker CLI itself uses for `ssh://` hosts.
+
+Alternatives considered:
+
+- **Incus proxy device to a socket on the Incus host.** The library cannot dial a socket on the Incus host through the Incus API, so every host would need its own way in. For Macus that is a second path through the guest boundary.
+- **Expose dockerd on the instance's network address.** Needs routing from the host to the instance network and TLS for dockerd, and is unreachable for a remote Incus target behind a gateway.
+
+Exec needs only the connection the host already has, and behaves the same for Macus and for a remote target. Its costs are one exec operation per engine connection and a dependency on half-close working across the exec channels. Task 1.2 is a spike that must confirm half-close and throughput before the rest is built on it.
+
+The transport is a behaviour, so a host with a faster private path can supply its own dialer. The library still never dials anything the host did not supply.
+
+### 7. Relay, do not interpret
+
+For `nested` routes the handler forwards method, path, query, headers and body, and returns status, headers and body as the engine sent them. It changes only hop-by-hop headers and the bind sources the host mapped. Hijacked and upgraded connections (`attach`, `exec/start`, `/session`, `/grpc`) are relayed in both directions with half-close preserved.
+
+Each client request uses its own engine connection for its whole life. There is no multiplexing and no pool in this change, so one stalled stream cannot block another inside the library. Whether the host's path to Incus keeps streams independent is the host's responsibility, and the Macus acceptance in task 6.3 measures it.
+
+Backpressure follows the sockets: the relay reads from one side only as fast as the other side accepts, with a bounded buffer.
+
+### 8. Never replay a possibly accepted mutation
+
+If the engine connection fails after any request byte was sent on a non-GET/HEAD request, the handler returns an error and does not retry. A failure before any byte was sent may be reported as the engine being unavailable. GET and HEAD are not retried either in this change; there is no need yet.
+
+### 9. Bind mounts need a host decision
+
+`POST /containers/create` can name bind mount sources in `HostConfig.Binds` and in `HostConfig.Mounts` entries of type `bind`. Those paths are the client's, not the engine instance's. Relaying them unchanged would make dockerd create an empty directory inside the instance and start the container with the wrong content, without an error.
+
+So the handler extracts each bind source and calls `map_bind_source/2`. The host returns the path as the engine instance sees it, or denies. Without the callback, a create that names any bind source is refused with a 400 engine error before the engine is contacted. Named volumes and tmpfs mounts pass unchanged. This is the only request body the handler rewrites.
+
+Making a host directory visible inside the engine instance (for Macus, a shared directory attached as an Incus disk device) is host work.
+
+### 10. Evidence levels
+
+`priv/docker/coverage.json` records evidence per route:
+
+- **Fixture:** the handler against a scripted engine connection.
+- **Differential:** the same request sent to a real pinned dockerd directly and through the library, with equal status, headers that matter and body. Needs an explicit opt-in and an isolated Incus project.
+- **Consumer:** acceptance run by the host, such as Macus on hardware.
+
+A `nested` route with differential evidence is verified as passthrough. That never counts as evidence for a later `native` implementation of the same route.
+
+## Risks / Trade-offs
+
+- **Exec as a transport may be slow or lose half-close.** The spike in task 1.2 runs first. If it fails, the fallback is a host-supplied dialer as the only transport, which moves work to each host.
+- **One exec per connection adds latency to short requests.** Accepted for now; a keep-alive pool is a later change with its own safety rules.
+- **Containers in the nested engine are invisible to Incus tooling.** That is the reason for the later native engine, and the README says so.
+- **The engine image is the host's.** A host can supply an image whose dockerd is older than the reference. The readiness check refuses an engine whose API range does not include the reference's minimum.
+- **Docker socket access is root on the engine instance, and nesting weakens isolation.** The host authorizes every request, and the documentation states that the engine instance is one trust domain.
+
+## Open Questions
+
+- Which Docker Engine release to pin, and whether to track its API description or its Go client as the reference (task 1.1).
+- Whether BuildKit's `/grpc` upgrade survives the exec transport unchanged (task 1.2).
+- Whether `authorize/2` needs more than method, route and class to be useful to Macus, for example the container name for per-project policy.
+
+## Follow-up Changes
+
+1. Native engine for container lifecycle, exec and logs on Incus OCI application containers.
+2. A shared image store, so an image built by the nested engine can run natively.
+3. Published-port reporting to the host and native networks and volumes.
+4. A libpod frontend, if the `podman` CLI is a target.
