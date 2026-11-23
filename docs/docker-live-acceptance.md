@@ -52,3 +52,69 @@ HTTP 101 for `Upgrade: tcp` on exec start and `Upgrade: h2c` on both
 `POST /grpc` and `POST /session`. Several BuildKit tunnel teardown paths
 reported stream failures after the upgrade, even though the build and
 subsequent image inspection succeeded.
+
+## Replacement exec helper on 2026-11-24
+
+The follow-up reused the same isolated Incus project and engine instance.
+It built a static Linux arm64 [guest bridge](../scripts/acceptance/exec_socket_bridge.go)
+with Go 1.25.14 and uploaded it through the Incus file API. The
+[acceptance dialer](../scripts/acceptance/exec_socket_bridge.ex) passes
+stdin through to the Unix socket and decodes bounded stdout frames. An
+explicit output EOF frame preserves the writable direction on the exec
+session. Docker clients receive the original bytes.
+
+Both [half-close cases](../scripts/acceptance/exec_socket_bridge_half_close.ex)
+passed over authenticated Incus exec. When client input ended first, the
+peer received it and the client received the peer's response afterward.
+When peer output ended first, the client observed EOF and successfully
+sent a marker afterward. The guest peer verified the exact input in each
+case, and both bridge processes exited with status zero. The pinned
+Docker CLI also received output after stdin EOF on an attached exec
+through the full relay.
+
+To reproduce, build the helper for the fixture architecture from a pinned
+Go toolchain, install it inside the disposable engine and pass the approved
+connected target to the acceptance module.
+
+```sh
+CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -buildvcs=false \
+  -o /tmp/exec-socket-bridge scripts/acceptance/exec_socket_bridge.go
+```
+
+```elixir
+Code.require_file("scripts/acceptance/exec_socket_bridge.ex")
+Code.require_file("scripts/acceptance/exec_socket_bridge_half_close.ex")
+
+Opsmaru.Containers.Acceptance.ExecSocketBridgeHalfClose.run(
+  target,
+  "/absolute/guest/path/to/exec-socket-bridge"
+)
+```
+
+### Separate upload investigation
+
+The matrix sent the same 8,388,608-byte file in nine archive requests,
+using a fresh destination for each trial. Both direct paths bypassed the
+library's HTTP handler. The full relay used the same replacement helper
+behind the library. The disposable Plug listener buffered its request
+body before forwarding, so the full-relay result applies to that host
+adapter and its write pacing.
+
+| Path | HTTP 200 and matching SHA-256 | Partial destinations on disconnect |
+| --- | --- | --- |
+| Docker stdio helper, direct | 2 of 3 | 6,856,192 bytes, client observed a socket hang-up |
+| Replacement helper, direct | 1 of 3 | 4,169,192 and 4,914,688 bytes, client observed write `EPIPE` |
+| Replacement helper, full relay | 3 of 3 | None observed |
+
+The investigation reproduced the partial write with both helpers. The
+reverse half-close fix leaves upload reliability as a separate
+qualification item. The original upload and the later failures used
+distinct destination paths.
+
+A Docker-free Incus exec control sent the same payload in 16 KiB pieces
+to a fresh file. All 8,388,608 bytes arrived and matched SHA-256 in
+50.8 seconds. An earlier checksum-only control accepted all input writes
+but timed out waiting for its output, so it could not establish what
+reached the guest. The file-backed control verified delivery for that
+trial. The exact source of the intermittent disconnects remains
+unresolved.

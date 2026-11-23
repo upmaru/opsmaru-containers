@@ -93,6 +93,16 @@ observed a partial large upload and BuildKit teardown errors. Host-supplied
 dialers remain the supported transport. The differential and pinned CLI
 results apply to the tested workflows.
 
+The follow-up qualification tested a replacement helper inside the
+host-provided engine instance. The helper copies exec stdin to dockerd and
+half-closes the dockerd socket's write side on stdin EOF. It sends bounded
+data frames and an explicit output EOF frame on exec stdout. The host
+adapter consumes those frames before passing Docker bytes to the relay.
+The helper continued forwarding input after output EOF in the live
+half-close test. Separate upload trials reproduced disconnects on the
+direct path with both helpers. Qualification stays open for upload
+reliability.
+
 ### 7. Relay, do not interpret
 
 For `nested` routes the handler forwards method, path, query, headers and body, and returns status, headers and body as the engine sent them. It handles hop-by-hop headers, transfer framing, version caps and mapped bind sources as specified. Preserve end-to-end headers, including repeated values. The relay carries the negotiated upgrade headers across the handshake and preserves raw bytes already read by either side. Hijacked and upgraded connections (`attach`, `exec/start`, `/session`, `/grpc`) are relayed in both directions with half-close preserved.

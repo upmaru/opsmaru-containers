@@ -30,7 +30,7 @@
   {"method": "POST", "path": "/containers/{name:.*}/update", "class": "nested", "fixture": [], "differential": [], "real_incus": [], "consumer": []},
   {"method": "POST", "path": "/containers/prune", "class": "nested", "fixture": [], "differential": [], "real_incus": [], "consumer": []},
   {"method": "POST", "path": "/commit", "class": "nested", "fixture": [], "differential": [], "real_incus": [], "consumer": []},
-  {"method": "PUT", "path": "/containers/{name:.*}/archive", "class": "nested", "fixture": [], "differential": [], "real_incus": ["2026-11-23: full 8 MiB payload verified at a fresh destination after a separate partial upload"], "consumer": []},
+  {"method": "PUT", "path": "/containers/{name:.*}/archive", "class": "nested", "fixture": [], "differential": [], "real_incus": ["2026-11-23: full 8 MiB payload verified at a fresh destination after a separate partial upload", "2026-11-24: three buffered-host relay uploads matched 8 MiB SHA-256; three direct trials across both exec helpers left partial files"], "consumer": []},
   {"method": "DELETE", "path": "/containers/{name:.*}", "class": "nested", "fixture": [], "differential": [], "real_incus": ["2026-11-23: pinned Docker and Compose removed their workloads"], "consumer": []},
   {"method": "GET", "path": "/images/json", "class": "nested", "fixture": [], "differential": ["2026-11-23: pinned Docker direct and relayed status, meaningful headers, and normalized body matched"], "real_incus": ["2026-11-23: isolated Incus 7.0.1 fixture with Docker 29.10.0"], "consumer": []},
   {"method": "GET", "path": "/images/search", "class": "nested", "fixture": [], "differential": [], "real_incus": [], "consumer": []},
