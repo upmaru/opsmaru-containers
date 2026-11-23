@@ -1,0 +1,15 @@
+# Project instructions
+
+Use the pinned mise Elixir/OTP and Node/OpenSpec tools. opsmaru-containers is a pure Elixir library (`:opsmaru_containers`) that serves container engine APIs (the Docker Engine API first, Podman's libpod API possibly later) from Incus, for hosts such as Macus and central Opsmaru. Keep it a library: no application callback, endpoint, repository, listener, credentials, runtime state or backend connection may start merely because a host loads or starts the dependency. Hosts own the listener and supply connections, verified identity and readiness explicitly on every call.
+
+Incus remains the canonical workload backend and `opsmaru_incus` is the only route to it. Never invoke a host CLI, probe local Incus or Docker sockets, open a backend connection the host did not supply, or add Apple virtualization, Macus, Phoenix, Ecto, durable task or central-service code here. Keep no database: engine metadata such as container IDs, names and labels lives on Incus objects. Host concerns stay with the host: the socket, the docker context, path mapping for bind mounts, forwarding published ports and the transport to the Incus guest. Plug and Cowboy, when added, stay optional dependencies.
+
+Preserve the engine API's wire behavior: routes, version negotiation, error shapes, status codes and streaming/hijack semantics. Never replay a possibly accepted mutation. An endpoint that is not supported must say so with the engine's own error shape, never succeed silently or return invented data.
+
+Use OpenSpec for substantial behavior changes and validate planning before implementation. Keep evidence honest: distinguish fixture checks, differential checks against a real pinned engine, explicit real-Incus acceptance and consumer-owned Macus acceptance. Passthrough to the nested engine never counts as evidence for a native implementation. Do not advertise compatibility that is not verified.
+
+Run `mise trust` and `mise install` for the checkout. The canonical check is `mise run check`. Real-backend acceptance requires explicit opt-in, an isolated project and private credentials; never run tests against production data or commit ignored `_build`, `deps`, `.integration`, secrets or acceptance state.
+
+Use Git Flow: main is released history, develop is integration, feature/* starts from develop, release/* starts from develop and finishes into both branches, and hotfix/* starts from main and finishes into both. Publish development work on its feature branch. Hex is the only distribution route for the package. Do not finish/merge branches, create release tags or publish packages without user authorization.
+
+Every pull request opened by a bot or automated agent must be created as a draft (for example, `gh pr create --draft`) and remain a draft until a human marks it ready for review. Bots and agents must never mark any pull request ready for review, including after checks pass or when asked to prepare it for review. Only a human may perform that transition. If an agent mistakenly opens a non-draft pull request, it must convert that pull request back to draft; a later human decision to mark it ready must be respected.

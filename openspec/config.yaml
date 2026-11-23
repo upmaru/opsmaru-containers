@@ -1,0 +1,25 @@
+schema: spec-driven
+context: |
+  opsmaru-containers is a pure Elixir library, OTP application
+  :opsmaru_containers, modules Opsmaru.Containers.*. It serves container
+  engine APIs from Incus: the Docker Engine API first, Podman's libpod API
+  possibly later, over one shared core. It has no application callback and
+  never starts processes, listeners, state or backend connections on load.
+  Consumers: Macus mounts the engine API on its own Unix socket on macOS and
+  reaches Incus in its guest over its private relay; central Opsmaru may mount
+  it for registered remote Incus targets. Incus is the canonical workload
+  backend and opsmaru_incus (Hex, pinned to Incus v7.0.1) is the only route
+  to it. Hosts supply connections, verified identity, readiness, the
+  listener, authorization, bind-mount path mapping, published-port forwarding
+  and the transport to the guest; the library never probes sockets, runs host
+  commands or keeps a database. Engine metadata lives on Incus objects under
+  user.opsmaru.containers.* keys. Two engines sit behind one API: a nested
+  engine (dockerd in an Incus system container; full compatibility and all
+  builds) and a planned native engine (Incus OCI application containers) that
+  takes over endpoints one at a time. Preserve the engine API's routes,
+  version negotiation, error shapes and streaming/hijack semantics, and never
+  replay a possibly accepted mutation. Fixture, real-engine differential,
+  real-Incus and Macus acceptance evidence are distinct, and nested
+  passthrough never counts as native evidence. Pin dependencies as ranges
+  here; consumers lock exact versions. Use Git Flow feature branches from
+  develop. The canonical check is mise run check.
