@@ -210,3 +210,55 @@ used the installed gateway and the opt-in client workaround.
 The stdin stall still needs correlated gateway ingress, completed
 backend writes and relay backpressure measurements on the same
 operation. The exec transport qualification remains open.
+
+### Macus gateway with opsmaru_incus 0.2.10
+
+On 2026-11-25 the Macus build at `1514bab` ran a separate loopback
+gateway with a private state directory and a verified
+`opsmaru_incus` 0.2.10 bundle. The gateway used the existing Macus
+runtime to reach the same isolated Incus 7.0.1 project and Docker
+29.10.0 instance. The acceptance client used its original 8-second
+write budget and disabled WebSocket keepalives.
+
+The 8 MiB paced upload streamed 16 KiB every 160 ms and returned HTTP
+200 after 82.5 seconds. The earlier 0.2.9 trials closed the quiet
+stdout channel at about 66 seconds. The 0.2.10 gateway kept stdout open
+through the Docker response.
+
+To correlate the stdin trace, the run joined each client WebSocket to
+the gateway's exchange stop event by Incus operation ID and client
+port. Separate samples recorded bytes admitted by the gateway, bytes
+acknowledged by its Unix-socket writer, queued bytes and input pause
+state. These counters measure the gateway and its socket, while the
+workload file size and SHA-256 establish delivery.
+
+| Upload path | Client-visible result |
+| --- | --- |
+| 0.2.10 full relay, paced 8 MiB | HTTP 200 in 82.5 seconds |
+| 0.2.10 full relay, unpaced 8 MiB | Three HTTP 200 responses in about 10.9 seconds each |
+| 0.2.10 full relay, unpaced 24 MiB | HTTP 200 in 32.4 seconds |
+| 0.2.10 direct bridge, unpaced 8 MiB | HTTP 200 in 21.6 seconds |
+| 0.2.10 full relay, unpaced 8 MiB with sampling disabled | HTTP 200 in 10.9 seconds |
+| Original 0.2.9 gateway, unpaced 8 MiB through the full relay | Two HTTP 200 responses in 24.1 and 32.5 seconds |
+
+Every Docker upload used a fresh destination and matched its expected
+size and SHA-256.
+
+The ordinary 0.2.10 trials with sampling recorded no input pause.
+The largest sampled queue was 49,152 bytes. The 8 MiB streaming
+trials each accounted for 8,390,315 stdin bytes in the gateway access
+log, including the HTTP headers. The client saw the Docker response
+before the subsequent WebSocket teardown. A Docker-free stdin
+control also delivered 8 MiB and exited zero.
+
+A second Docker-free control delayed reading stdin for 14 seconds.
+The gateway's Unix-socket writer blocked in `:prim_inet.send/4`. At
+the first input pause, the gateway had admitted 778,240 bytes, with
+507,904 acknowledged by its writer, 262,144 queued and 8,192 in
+flight. A client TLS write took 7.976 seconds. Once the guest began
+reading, the queue drained and the complete file matched SHA-256.
+This control shows how backpressure at the backend Unix socket
+reaches the client. The intermittent timeout from the earlier runs
+did not recur during ordinary uploads, so its original cause remains
+open. This run qualifies removal of the premature idle close on the
+tested gateway path. The wider exec transport gate remains open.
