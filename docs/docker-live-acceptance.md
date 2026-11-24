@@ -116,5 +116,64 @@ to a fresh file. All 8,388,608 bytes arrived and matched SHA-256 in
 50.8 seconds. An earlier checksum-only control accepted all input writes
 but timed out waiting for its output, so it could not establish what
 reached the guest. The file-backed control verified delivery for that
-trial. The exact source of the intermittent disconnects remains
-unresolved.
+trial.
+
+### Traced direct and streaming uploads
+
+A follow-up reused the same Incus 7.0.1 project, authenticated TLS
+gateway, and Docker Engine 29.10.0. Each request used a fresh destination
+and contained an 8,390,144-byte fixed-length tar with the same
+8,388,608-byte file. The listener traced client reads, writes to the
+Incus exec channels, WebSocket closes, and the backend HTTP response.
+The incremental listener passed the request to the library as soon as
+it had parsed the headers. The first write to the bridge followed only
+8,192 bytes read from the client, including the headers. The first
+64 KiB body read still left 8,324,608 bytes unread. The buffered
+control read the entire request before starting the same relay.
+
+| Upload path | HTTP 200 and matching SHA-256 | Failed request and bytes found in the workload |
+| --- | --- | --- |
+| Direct bridge | 3 of 3 | None in the unpaced trials |
+| Full relay, incremental listener | 2 of 3 | HTTP 502, 212,480 bytes |
+| Full relay, buffered listener | 2 of 3 | HTTP 502, 200,184 bytes |
+| Direct bridge, paced | 0 of 1 | Client write `EPIPE`, 196,096 bytes |
+| Full relay, incremental listener, paced | 0 of 1 | HTTP 502, 6,749,696 bytes |
+| Full relay, buffered listener, paced | 1 of 1 | None observed |
+
+The paced client sent 16 KiB at a time with a 160 ms interval. Its direct
+upload failed about 26 seconds after connection. The first failure was
+a TLS write timeout reported by Mint on exec stdin WebSocket channel
+`0`, using the acceptance client's 8-second socket write timeout.
+At that point, writes for 1,859,762 request bytes had returned success
+locally. The exec operation was still running when cleanup began. The
+other WebSockets closed during cleanup, and the local client then
+received `EPIPE`. The local write count measures bytes accepted by the
+TLS sender. The file size measures bytes that reached the destination.
+
+The unpaced incremental and buffered relay failures also began with
+stdin WebSocket write timeouts while the exec operation was running.
+Both relays returned a Docker-shaped 502 and each left a partial
+destination. The paced buffered control succeeded after about 82
+seconds receiving the tar followed by 27 seconds forwarding it. The
+unpaced buffered failure shows that the write stall can occur after
+the listener has already received the whole body. Each trial used a
+fresh destination.
+
+The paced incremental relay had a different event order. Its stdout
+WebSocket closed with code 1000 about 66 seconds after connection,
+before stdin closed and the relay returned 502. The operation was
+already terminal when the relay checked it, and the payload was
+incomplete. A separate guest-local archive upload to the same dockerd
+socket produced all 8,388,608 bytes and a matching SHA-256. The exec
+session used to launch that control timed out collecting its result,
+so the file was verified in a separate read.
+
+A Docker-free control piped 8 KiB pieces through the same Incus stdin
+WebSocket into a guest file. Individual TLS writes took up to 5.1
+seconds. The operation exited zero and the full file matched SHA-256
+after 56 seconds. The long write stalls also occurred without the
+guest bridge or dockerd in the data path.
+
+The cause of the early stdout close and the cause of the underlying
+write stalls farther downstream remain unverified. The exec transport
+qualification remains open.
