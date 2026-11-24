@@ -174,6 +174,39 @@ seconds. The operation exited zero and the full file matched SHA-256
 after 56 seconds. The long write stalls also occurred without the
 guest bridge or dockerd in the data path.
 
-The cause of the early stdout close and the cause of the underlying
-write stalls farther downstream remain unverified. The exec transport
-qualification remains open.
+### Follow-up on the early close and write stalls
+
+The installed gateway uses Cowboy 2.21.0 with a 60-second WebSocket idle
+timeout. Cowboy resets that timer on inbound bytes and sends close code
+1000 when it expires. The gateway consumes Incus pings on the backend
+hop. A quiet stdout socket can therefore close on the frontend while
+the gateway is still exchanging frames with Incus.
+[Cowboy 2.21.0 timer and close handling](https://github.com/ninenines/cowboy/blob/2.21.0/src/cowboy_websocket.erl#L389).
+
+In the same fixture, a quiet exec meant to emit a marker after 75 seconds
+lost stdout at 66.1 seconds and exited 137. A paired exec with a WebSocket
+ping every 15 seconds on stdout, stderr and control emitted the marker at
+75.0 seconds and exited zero. The acceptance dialer exposes that control
+as `keepalive_interval: 15_000`. These are WebSocket control frames scoped
+to the client-to-gateway hop.
+
+Paced 8 MiB streaming uploads without pings failed with an early stdout
+close at both the 8-second and 24-second client write budgets. With pings,
+both returned HTTP 200 after about 82.5 seconds and all 8,388,608 bytes
+matched SHA-256. The 8-second trial exercised the acceptance dialer's
+`keepalive_interval` option. Separately, unpaced trials without pings
+reproduced the stdin write stall at both budgets. A single TLS write
+blocked for 8.001 seconds in one trial and 24.000 seconds in the other.
+Both relays returned HTTP 502 and left partial files of 196,088 and
+212,480 bytes respectively.
+
+A synthetic `opsmaru_incus` gateway fixture also reproduced the premature
+close during active backend-only output. With the gateway's own watchdog
+handling both directions and Cowboy's receive-only timer disabled, the
+new regression and the WebSocket and telemetry suites passed all 70
+tests. This was a disposable gateway source snapshot. The live tests
+used the installed gateway and the opt-in client workaround.
+
+The stdin stall still needs correlated gateway ingress, completed
+backend writes and relay backpressure measurements on the same
+operation. The exec transport qualification remains open.

@@ -4,19 +4,22 @@ defmodule Opsmaru.Containers.Acceptance.ExecSocketBridge do
 
   The host supplies the helper path, engine socket and connected Incus target.
   Framing stays inside the exec stream. The Docker relay receives only peer
-  bytes and directional EOF.
+  bytes and directional EOF. An optional `:keepalive_interval` in milliseconds
+  sends WebSocket pings on stdout, stderr and control during acceptance.
   """
 
   @behaviour Opsmaru.Containers.Transport
   @behaviour Opsmaru.Containers.Transport.Stream
 
   alias Opsmaru.Containers.Transport.Stream
-  alias Opsmaru.Incus.{Error, Operation, Session}
+  alias Opsmaru.Incus.{Error, Operation, Session, WebSocket}
 
   @chunk_size 16_384
 
   @impl Opsmaru.Containers.Transport
   def dial(target, %{helper: helper, socket: socket} = options, deadline) do
+    keepalive_interval = options[:keepalive_interval]
+
     request = %{
       "command" => [helper, socket],
       "interactive" => false,
@@ -24,23 +27,57 @@ defmodule Opsmaru.Containers.Acceptance.ExecSocketBridge do
       "record-output" => false
     }
 
-    with {:ok, session} <- Session.exec(target.client, target.instance, request) do
-      start_stream(session, options[:observer], deadline)
+    with :ok <- validate_keepalive(keepalive_interval),
+         {:ok, session} <- Session.exec(target.client, target.instance, request) do
+      start_stream(session, options[:observer], keepalive_interval, deadline)
     end
   end
 
-  defp start_stream(session, observer, deadline) do
+  defp validate_keepalive(nil), do: :ok
+
+  defp validate_keepalive(interval) when is_integer(interval) and interval in 1..3_600_000,
+    do: :ok
+
+  defp validate_keepalive(_), do: {:error, :invalid_keepalive_interval}
+
+  defp start_stream(session, observer, keepalive_interval, deadline) do
     {:ok, buffer} = Agent.start_link(fn -> "" end)
-    handle = %{session: session, buffer: buffer, observer: observer}
+    handle = %{session: session, buffer: buffer, observer: observer, keepalive: nil}
     spawn_link(fn -> drain_stderr(handle, deadline) end)
 
     case take(handle, 4, deadline) do
       {:ok, "OCB1"} ->
-        {:ok, %Stream{adapter: __MODULE__, handle: handle}}
+        keepalive = start_keepalive(handle, keepalive_interval)
+        {:ok, %Stream{adapter: __MODULE__, handle: %{handle | keepalive: keepalive}}}
 
       failure ->
         close(handle)
         {:error, {:bridge_handshake, failure}}
+    end
+  end
+
+  defp start_keepalive(_, nil), do: nil
+
+  defp start_keepalive(handle, interval) do
+    owner = self()
+    channels = Map.take(handle.session.channels, ["1", "2", "control"])
+
+    spawn(fn -> keepalive(Process.monitor(owner), channels, handle, interval) end)
+  end
+
+  defp keepalive(owner, channels, handle, interval) do
+    receive do
+      {:DOWN, ^owner, :process, _, _} -> :ok
+    after
+      interval ->
+        for {name, channel} <- channels do
+          case WebSocket.send_frame(channel, {:ping, ""}) do
+            :ok -> :ok
+            {:error, %Error{kind: kind}} -> notify(handle, {:bridge_keepalive, name, kind})
+          end
+        end
+
+        keepalive(owner, channels, handle, interval)
     end
   end
 
@@ -165,6 +202,7 @@ defmodule Opsmaru.Containers.Acceptance.ExecSocketBridge do
   @impl Stream
   def close(handle) do
     session = handle.session
+    if handle.keepalive, do: Process.exit(handle.keepalive, :kill)
 
     case Operation.poll(session.operation) do
       {:ok, operation} ->
