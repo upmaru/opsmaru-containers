@@ -262,3 +262,27 @@ reaches the client. The intermittent timeout from the earlier runs
 did not recur during ordinary uploads, so its original cause remains
 open. This run qualifies removal of the premature idle close on the
 tested gateway path. The wider exec transport gate remains open.
+
+## Exec qualification rerun on opsmaru_incus 0.2.10
+
+On 2026-11-25 the replacement bridge passed the exec transport gates
+through the same 0.2.10 Macus gateway, isolated Incus 7.0.1 project and
+Docker Engine 29.10.0 instance. The client used an eight-second socket
+write budget and left bridge keepalives disabled. The test-owned Unix
+listeners explicitly supplied the bridge.
+
+| Gate | Observed result |
+| --- | --- |
+| Setup and duplex EOF | Setup took 35–86 ms across the instrumented Docker listeners. The synthetic Unix peer verified the exact payload in both half-close directions. Both helpers exited zero. The pinned CLI also delivered attached exec output after stdin EOF. |
+| Idle stream | A filtered Docker events stream stayed open with no matching event for 75.0 seconds. A separate ping took 129 ms while it was open. The same stream returned the new container's create event afterward. Its operation was terminal when the bridge closed. |
+| Independent requests and disconnect | Three relay pings took 253, 179 and 181 ms while a client paused a 24 MiB archive download. The original download was still connected when the pings finished. When the client disconnected, its exec operation reached terminal state in the 17 ms bridge cleanup phase. |
+| Partial setup and final cleanup | After only stdin was attached and then closed, Incus reported the exec setup timeout at 10.3 seconds. The helper never started. All 221 instrumented listener execs reached terminal state, and the instance had no remaining bridge helper processes. |
+| Large payloads | An 8 MiB archive download matched the payload SHA-256 in 2.59 seconds. All three fresh 8 MiB uploads matched SHA-256. The paced upload took 82.4 seconds and the two unpaced uploads took 10.9 and 11.0 seconds. |
+| Differential and CLI | All six read-only differential cases passed. Docker CLI 29.10.0, Compose 5.8.0 and Buildx 0.39.1 passed the pinned Alpine pull, run, attached exec, followed logs, build, image inspection, Compose up and down, and cleanup. |
+| BuildKit | The integrated Docker driver received HTTP 101 with `Upgrade: h2c` on `/grpc` and `/session`. A fresh no-cache build copied a unique fixture file. Running the resulting image returned the exact contents. The raw relay still reported `:stream_failed` when the frontend socket was already closed during teardown. The listener traced those cases to a failed frontend write or write shutdown, and the exec operations reached terminal state. |
+
+The intermittent stdin write stall remains open. The three fresh uploads
+completed with the original write budget, so this rerun adds successful
+trials and leaves the earlier partial uploads on record. This qualifies
+the replacement bridge for the tested stack. Production transport
+selection and Macus consumer acceptance are separate.

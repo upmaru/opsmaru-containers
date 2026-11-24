@@ -100,8 +100,10 @@ data frames and an explicit output EOF frame on exec stdout. The host
 adapter consumes those frames before passing Docker bytes to the relay.
 The helper continued forwarding input after output EOF in the live
 half-close test. Separate upload trials reproduced disconnects on the
-direct path with both helpers. Qualification stays open for upload
-reliability.
+direct path with both helpers. The [0.2.10 rerun](../../../docs/docker-live-acceptance.md#exec-qualification-rerun-on-opsmaru_incus-0210)
+qualified the replacement helper for the tested gateway and fixture.
+The intermittent stdin write stall remains open. The supported library
+entry point continues to use the dialer supplied by the host.
 
 ### 7. Relay, do not interpret
 

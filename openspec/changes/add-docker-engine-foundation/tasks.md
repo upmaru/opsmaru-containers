@@ -5,7 +5,8 @@
 - [x] 1.1 Record Docker Engine and CLI 29.10.0, Compose 5.8.0 and Buildx 0.39.1 for the Docker builder driver. Record source commits, API bounds and the SHA-256 and license of the pinned OpenAPI description.
 - [x] 1.2 Generate and check the route inventory from the pinned description and audited daemon route supplement. Classify every route with a reason for exclusion and record takeover semantics. Run the reference check in canonical CI.
 - [x] 1.3 Spike a host-owned Unix listener with a scripted backend. Prove handoff of already-read bytes, HTTP 101 and Docker raw 200 handshakes, independent write EOF and disconnect cleanup through the proposed host adapter.
-- [ ] 1.4 With explicit opt-in and an isolated Incus v7.0.1 project, qualify the stdio helper. Measure setup and throughput and prove EOF, independent requests, cleanup after interruption or partial setup, and operation with large payloads and long idle periods. Record the result before enabling exec as a default.
+- [x] 1.4 With explicit opt-in and an isolated Incus v7.0.1 project, qualify the stdio helper. Measure setup and throughput and prove EOF, independent requests, cleanup after interruption or partial setup, and operation with large payloads and long idle periods. Record the result before enabling exec as a default.
+  - The [0.2.10 qualification rerun](../../../docs/docker-live-acceptance.md#exec-qualification-rerun-on-opsmaru_incus-0210) passed with the replacement helper. The intermittent stdin write stall remains open.
 - [x] 1.5 Join the listener and chosen transport. Prove interactive exec and the pinned Buildx Docker driver against the pinned daemon and record the actual handshakes. If exec misses qualification, require the host dialer.
 
 ## 2. Passive embedding and lifecycle
