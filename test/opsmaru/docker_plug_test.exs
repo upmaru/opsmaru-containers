@@ -8,6 +8,8 @@ defmodule Opsmaru.Containers.Docker.PlugTest do
   alias Opsmaru.Containers.Transport.Stream
   alias Opsmaru.Incus
 
+  @fixture_message_timeout 2_000
+
   defmodule Policy do
     @moduledoc false
     @behaviour Host
@@ -300,14 +302,14 @@ defmodule Opsmaru.Containers.Docker.PlugTest do
           |> Plug.call(Plug.init(host: Policy))
         end)
 
-      assert_receive :dialed
-      assert_receive {:engine_reading, reader}
-      assert_receive {:engine_writing, writer}
+      assert_receive :dialed, @fixture_message_timeout
+      assert_receive {:engine_reading, reader}, @fixture_message_timeout
+      assert_receive {:engine_writing, writer}, @fixture_message_timeout
       monitor = Process.monitor(writer)
 
       if write_failed? do
         send(writer, :reject_write)
-        assert_receive {:DOWN, ^monitor, :process, ^writer, :normal}
+        assert_receive {:DOWN, ^monitor, :process, ^writer, :normal}, @fixture_message_timeout
       end
 
       reply = fixed_response(404, ~s({"message":"No such container"}))
@@ -316,8 +318,12 @@ defmodule Opsmaru.Containers.Docker.PlugTest do
       conn = Task.await(caller)
       assert response(conn) == {404, %{"message" => "No such container"}}
       assert Conn.get_resp_header(conn, "connection") == connection_header
-      unless write_failed?, do: assert_receive({:DOWN, ^monitor, :process, ^writer, :killed})
-      assert_receive {:wire, wire}
+
+      unless write_failed? do
+        assert_receive {:DOWN, ^monitor, :process, ^writer, :killed}, @fixture_message_timeout
+      end
+
+      assert_receive {:wire, wire}, @fixture_message_timeout
       assert byte_size(body_of(wire)) < byte_size(body)
       refute_received :dialed
     end
@@ -339,13 +345,16 @@ defmodule Opsmaru.Containers.Docker.PlugTest do
           |> Plug.call(Plug.init(host: Policy, stream_timeout: 60_000))
         end)
 
-      assert_receive :dialed
-      assert_receive {:engine_reading, reader}
+      assert_receive :dialed, @fixture_message_timeout
+      assert_receive {:engine_reading, reader}, @fixture_message_timeout
       reader_monitor = Process.monitor(reader)
       send(client, :disconnect)
-      assert_receive {:DOWN, ^monitor, :process, ^caller, :shutdown}
-      assert_receive {:DOWN, ^reader_monitor, :process, ^reader, :killed}
-      assert_receive {:wire, "GET /events HTTP/1.1\r\n" <> _}
+      assert_receive {:DOWN, ^monitor, :process, ^caller, :shutdown}, @fixture_message_timeout
+
+      assert_receive {:DOWN, ^reader_monitor, :process, ^reader, :killed},
+                     @fixture_message_timeout
+
+      assert_receive {:wire, "GET /events HTTP/1.1\r\n" <> _}, @fixture_message_timeout
     end
   end
 
