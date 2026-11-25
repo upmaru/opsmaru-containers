@@ -40,6 +40,16 @@ For ordinary HTTP, explicitly include Plug in the host, then mount
 verified listener data in `conn.private[:opsmaru_containers_peer]`. The
 library's Plug path also handles detached exec.
 
+To cancel pending engine I/O on disconnect, put a separate host-owned PID in
+`conn.private[:opsmaru_containers_client]` before invoking the Plug. The PID
+must exit when the client disconnects. For a multiplexed listener, use a PID
+that tracks the individual request stream so a stream reset cancels its relay.
+
+The relay reads engine responses while forwarding uploads. An early final
+response stops further writes and closes an HTTP/1.x client connection if its
+request body remains unread. If the Plug adapter is currently reading the
+client body, the relay can act on the engine response once that read returns.
+
 For attaches, attached exec, and requests upgrading to WebSocket or h2c, the
 host's HTTP/1.1 listener hands off its stream to
 `Opsmaru.Containers.Docker.Raw.relay/4`. Pass the parsed method, origin-form

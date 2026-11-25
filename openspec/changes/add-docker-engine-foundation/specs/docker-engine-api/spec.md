@@ -92,8 +92,13 @@ Hijacked and upgraded connections (container attach, exec start, the BuildKit se
 
 #### Scenario: Client disconnects mid-stream
 
-- **WHEN** a client closes its connection during a followed log stream
-- **THEN** the engine connection for that request is closed and its resources are released
+- **WHEN** the host signals a client disconnect during a quiet followed log stream
+- **THEN** the pending engine read is interrupted and the connection is closed without waiting for activity from Docker
+
+#### Scenario: Docker rejects a streaming upload early
+
+- **WHEN** Docker sends a final response before the relay finishes forwarding a request body
+- **THEN** the relay stops forwarding the body and returns Docker's response, including its status and error body
 
 ### Requirement: No replay of possibly accepted mutations
 

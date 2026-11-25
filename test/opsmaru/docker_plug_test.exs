@@ -37,23 +37,79 @@ defmodule Opsmaru.Containers.Docker.PlugTest do
     @impl Transport
     def dial(_target, {observer, response}, _deadline) do
       send(observer, :dialed)
-      {:ok, connection} = Agent.start_link(fn -> {observer, response, []} end)
+      {response, block_upload?} = plan(response)
+      {:ok, connection} = Agent.start_link(fn -> {observer, response, [], block_upload?} end)
       {:ok, %Stream{adapter: __MODULE__, handle: connection}}
     end
 
+    defp plan(:reject_upload), do: {[:await], true}
+    defp plan(response), do: {response, false}
+
     @impl Stream
-    def recv(connection, _limit, _deadline) do
-      Agent.get_and_update(connection, fn
-        {observer, [next | rest], sent} -> {{:ok, next}, {observer, rest, sent}}
-        state -> {:eof, state}
-      end)
+    def recv(connection, limit, deadline) do
+      result =
+        Agent.get_and_update(connection, fn
+          {observer, {:after_write, expected, response}, sent, blocked} = state ->
+            if expected in sent,
+              do: {:retry, {observer, response, sent, blocked}},
+              else: {:pending, state}
+
+          {observer, [:await | rest], sent, blocked} ->
+            {{:await, observer}, {observer, rest, sent, blocked}}
+
+          {observer, [next | rest], sent, blocked} ->
+            {{:ok, next}, {observer, rest, sent, blocked}}
+
+          state ->
+            {:eof, state}
+        end)
+
+      case result do
+        :retry -> recv(connection, limit, deadline)
+        :pending -> wait_for_write(connection, limit, deadline)
+        {:await, observer} -> await_fixture_data(observer, deadline)
+        result -> result
+      end
+    end
+
+    defp wait_for_write(connection, limit, deadline) do
+      if deadline > System.monotonic_time(:millisecond) do
+        Process.sleep(1)
+        recv(connection, limit, deadline)
+      else
+        {:error, :deadline}
+      end
+    end
+
+    defp await_fixture_data(observer, deadline) do
+      send(observer, {:engine_reading, self()})
+
+      receive do
+        {:engine_data, data} -> {:ok, data}
+      after
+        max(0, deadline - System.monotonic_time(:millisecond)) -> {:error, :deadline}
+      end
     end
 
     @impl Stream
-    def send(connection, iodata, _deadline) do
-      Agent.update(connection, fn {observer, response, sent} ->
-        {observer, response, [iodata | sent]}
-      end)
+    def send(connection, iodata, deadline) do
+      bytes = IO.iodata_to_binary(iodata)
+
+      case Agent.get_and_update(connection, fn {observer, response, sent, blocked} ->
+             {{observer, blocked and sent != []}, {observer, response, [bytes | sent], blocked}}
+           end) do
+        {_, false} ->
+          :ok
+
+        {observer, true} ->
+          send(observer, {:engine_writing, self()})
+
+          receive do
+            :reject_write -> {:error, :closed}
+          after
+            max(0, deadline - System.monotonic_time(:millisecond)) -> {:error, :deadline}
+          end
+      end
     end
 
     @impl Stream
@@ -61,7 +117,7 @@ defmodule Opsmaru.Containers.Docker.PlugTest do
 
     @impl Stream
     def close(connection) do
-      {observer, _, sent} = Agent.get(connection, & &1)
+      {observer, _, sent, _} = Agent.get(connection, & &1)
       send(observer, {:wire, IO.iodata_to_binary(Enum.reverse(sent))})
       Agent.stop(connection)
     end
@@ -191,7 +247,8 @@ defmodule Opsmaru.Containers.Docker.PlugTest do
   end
 
   test "an upstream disconnect after a mutation attempt is reported without replay" do
-    conn = call("POST", "/containers/create", engine([]), ~s({"Image":"fixture"}))
+    body = ~s({"Image":"fixture"})
+    conn = call("POST", "/containers/create", engine({:after_write, body, []}), body)
     assert {502, %{"message" => "Docker engine connection failed"}} = response(conn)
     assert_received :dialed
     assert_received {:wire, wire}
@@ -202,13 +259,85 @@ defmodule Opsmaru.Containers.Docker.PlugTest do
 
   test "streams a large request in chunks and does not replay it" do
     body = :binary.copy(<<42>>, 140_000)
-    context = engine(fixed_response(200, "{}"))
+    context = engine({:after_write, "0\r\n\r\n", fixed_response(200, "{}")})
     assert {200, %{}} = response(call("POST", "/images/load", context, body))
     assert_received :dialed
     assert_received {:wire, wire}
     refute_received :dialed
     assert wire =~ "transfer-encoding: chunked\r\n"
     assert body_of(wire) |> count_payload(0) == byte_size(body)
+  end
+
+  test "returns Docker's rejection while an upload write is blocked or has failed" do
+    for {write_failed?, protocol, connection_header} <- [
+          {false, :"HTTP/1.1", ["close"]},
+          {true, :"HTTP/2", []}
+        ] do
+      context = engine(:reject_upload)
+      body = :binary.copy("a", 140_000)
+
+      caller =
+        Task.async(fn ->
+          conn = Test.conn("PUT", "/containers/missing/archive?path=/tmp", body)
+
+          conn =
+            if write_failed?,
+              do: Conn.put_req_header(conn, "content-length", Integer.to_string(byte_size(body))),
+              else: conn
+
+          conn
+          |> Test.put_http_protocol(protocol)
+          |> Conn.put_private(:opsmaru_containers_peer, {context, :allow})
+          |> Plug.call(Plug.init(host: Policy))
+        end)
+
+      assert_receive :dialed
+      assert_receive {:engine_reading, reader}
+      assert_receive {:engine_writing, writer}
+      monitor = Process.monitor(writer)
+
+      if write_failed? do
+        send(writer, :reject_write)
+        assert_receive {:DOWN, ^monitor, :process, ^writer, :normal}
+      end
+
+      reply = fixed_response(404, ~s({"message":"No such container"}))
+      send(reader, {:engine_data, IO.iodata_to_binary(["HTTP/1.1 100 Continue\r\n\r\n", reply])})
+
+      conn = Task.await(caller)
+      assert response(conn) == {404, %{"message" => "No such container"}}
+      assert Conn.get_resp_header(conn, "connection") == connection_header
+      unless write_failed?, do: assert_receive({:DOWN, ^monitor, :process, ^writer, :killed})
+      assert_receive {:wire, wire}
+      assert byte_size(body_of(wire)) < byte_size(body)
+      refute_received :dialed
+    end
+  end
+
+  test "a host disconnect interrupts an engine read before or after response commitment" do
+    head = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+
+    for replies <- [[:await], [head, :await]] do
+      context = engine(replies)
+      client = spawn(fn -> receive do: (:disconnect -> :ok) end)
+
+      {caller, monitor} =
+        spawn_monitor(fn ->
+          "GET"
+          |> Test.conn("/events")
+          |> Conn.put_private(:opsmaru_containers_peer, {context, :allow})
+          |> Conn.put_private(:opsmaru_containers_client, client)
+          |> Plug.call(Plug.init(host: Policy, stream_timeout: 60_000))
+        end)
+
+      assert_receive :dialed
+      assert_receive {:engine_reading, reader}
+      reader_monitor = Process.monitor(reader)
+      send(client, :disconnect)
+      assert_receive {:DOWN, ^monitor, :process, ^caller, :shutdown}
+      assert_receive {:DOWN, ^reader_monitor, :process, ^reader, :killed}
+      assert_receive {:wire, "GET /events HTTP/1.1\r\n" <> _}
+    end
   end
 
   test "a truncated stream aborts the committed response and closes the dial" do
