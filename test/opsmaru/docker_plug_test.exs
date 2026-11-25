@@ -209,9 +209,14 @@ defmodule Opsmaru.Containers.Docker.PlugTest do
     body =
       ~s({"Image":"demo","HostConfig":{"Binds":["/host/shared:/src:ro"],"Mounts":[{"Type":"bind","Source":"/host/shared","Target":"/dest"}]}})
 
-    context = engine(fixed_response(201, "{}"))
+    rewritten = String.replace(body, "/host/shared", "/engine/shared")
+    success = fixed_response(201, "{}")
+    context = engine({:after_write, rewritten, success})
+    options = [stream_timeout: 2_000]
 
-    assert {201, %{}} = response(call("POST", "/containers/create", context, body))
+    assert {201, %{}} =
+             response(call("POST", "/containers/create", context, body, :allow, options))
+
     assert_received {:wire, wire}
 
     assert Jason.decode!(body_of(wire)) == %{
@@ -225,7 +230,11 @@ defmodule Opsmaru.Containers.Docker.PlugTest do
            }
 
     original = ~s( {"Name":"data", "DriverOpts":{} } )
-    assert {201, %{}} = response(call("POST", "/volumes/create", context, original))
+    context = engine({:after_write, original, success})
+
+    assert {201, %{}} =
+             response(call("POST", "/volumes/create", context, original, :allow, options))
+
     assert_received {:wire, volume_wire}
     assert body_of(volume_wire) == original
   end
