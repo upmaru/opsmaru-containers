@@ -12,6 +12,14 @@ run = "mix deps.get"
 description = "Validate all OpenSpec artifacts strictly"
 run = "openspec validate --all --strict --no-interactive"
 
+[tasks."check:reference"]
+description = "Check the pinned Docker route inventory and evidence ledger"
+run = "mix docker.reference --check"
+
+[tasks."check:consumer"]
+description = "Build the Hex artifact and check fresh consumers with and without the web stack"
+run = "sh test/acceptance/hex_consumers.sh"
+
 [tasks.check]
 description = "Format, compile, strict Credo and library/fixture tests; no real backend"
 run = [
@@ -19,5 +27,6 @@ run = [
   "mix compile --warnings-as-errors",
   "mix credo --strict",
   "MIX_ENV=test mix do compile --warnings-as-errors + test --warnings-as-errors",
+  "mix docker.reference --check",
   "openspec validate --all --strict --no-interactive",
 ]

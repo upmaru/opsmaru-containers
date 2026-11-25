@@ -6,9 +6,10 @@ for Elixir hosts such as [Macus](https://github.com/upmaru/macus) and central
 so that `docker`, `docker compose` and tools that use `DOCKER_HOST` can work
 against an Incus backend.
 
-**Status: scaffold only.** No container engine API is implemented yet. The
-initial scope is planned in
-[openspec/changes/add-docker-engine-foundation](openspec/changes/add-docker-engine-foundation).
+**Status: Docker foundation in development.** Host embedding, nested engine
+lifecycle, and HTTP and raw relay paths have fixture coverage. Real-engine,
+real-Incus and Macus acceptance are tracked in the
+[OpenSpec change](openspec/changes/add-docker-engine-foundation).
 
 ## Design in brief
 
@@ -20,10 +21,9 @@ initial scope is planned in
   verified identity and readiness on every call.
 - **Incus is the only backend.** Everything goes through `opsmaru_incus`. The
   library keeps no database; engine metadata lives on Incus objects.
-- **Two engines behind one API.** A nested engine (dockerd inside an Incus
-  system container) gives full compatibility and handles builds. A native
-  engine (Incus OCI application containers) is planned to take over endpoints
-  one at a time.
+- **Nested Docker first.** The relay targets dockerd inside an Incus system
+  container. A later native engine based on Incus OCI application containers
+  can take over selected routes.
 
 ## Development
 
@@ -31,7 +31,11 @@ initial scope is planned in
 mise trust && mise install
 mix deps.get
 mise run check   # format, compile, strict Credo, tests, OpenSpec
+mise run check:consumer
 ```
 
 Planning lives in [openspec/](openspec). See [AGENTS.md](AGENTS.md) for the
 project rules.
+
+See the [embedding guide](docs/embedding.md) for host callbacks, lifecycle,
+and the raw socket handoff.
