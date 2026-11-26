@@ -147,7 +147,7 @@ jobs:
     needs: verify
     if: needs.verify.outputs.release == 'true'
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 90
     environment: release
     permissions:
       contents: read
@@ -169,88 +169,132 @@ jobs:
           archive="opsmaru_containers-${version}.tar"
           sha256sum "${archive}" | awk '{print $1}' > /tmp/archive.sha256
           cat /tmp/archive.sha256
-      - name: Inspect the Hex API
+      - name: Resolve Hex action
         id: hex
         env:
           VERSION: ${{ needs.verify.outputs.version }}
         run: |
           set -euo pipefail
-          version="${VERSION}"
-          package_body=$(curl -sS --connect-timeout 10 --max-time 60 -o /tmp/pkg.json -w '%{http_code}' "https://hex.pm/api/packages/${HEX_PACKAGE}" 2>/dev/null) || package_body="000"
-          release_body=$(curl -sS --connect-timeout 10 --max-time 60 -o /tmp/rel.json -w '%{http_code}' "https://hex.pm/api/packages/${HEX_PACKAGE}/releases/${version}" 2>/dev/null) || release_body="000"
-
-          for code in "${package_body}" "${release_body}"; do
-            case "${code}" in
-              200|201|404) ;;
-              *) echo "Unexpected Hex API status ${code}; refusing to guess" >&2; exit 1 ;;
-            esac
-          done
-
-          if [ "${package_body}" = "404" ]; then
-            echo "Hex package opsmaru_containers does not exist yet (bootstrap required)." >&2
-            echo "Bootstrap it once, manually, from the exact main merge commit:" >&2
-            echo "  1. mix hex.user auth" >&2
-            echo "  2. mix hex.publish (interactively, NOT with --yes, selecting the upmaru public owner)" >&2
-            echo "  3. Configure the org Hex form (Write, upmaru, opsmaru-containers, release.yml, release, public checked, opsmaru_containers, private unchecked)" >&2
-            echo "  4. Re-run this workflow. See .github/release-runbook.md" >&2
-            exit 1
-          fi
-
-          if [ "${release_body}" = "404" ]; then
-            echo "action=publish" >> "${GITHUB_OUTPUT}"
-          else
-            checksum=$(jq -r '.checksum | select(type == "string" and length > 0)' /tmp/rel.json)
-            has_docs=$(jq -r '.has_docs | select(type == "boolean")' /tmp/rel.json)
-            if [ -z "${checksum}" ] || [ -z "${has_docs}" ]; then
-              echo "Release endpoint returned unexpected JSON" >&2
-              cat /tmp/rel.json >&2
-              exit 1
-            fi
-            if [ "${checksum}" != "$(cat /tmp/archive.sha256)" ]; then
-              echo "Hex already has ${HEX_PACKAGE} ${version} with checksum ${checksum}, but this build is $(cat /tmp/archive.sha256)." >&2
-              echo "Refusing to republish or use --replace. If the release is genuinely identical (e.g. a provenance/path difference), confirm the checksums on hex.pm and approve a docs-only/manual re-publish; otherwise investigate the build before merging a new release." >&2
-              exit 1
-            fi
-            if [ "${has_docs}" = "true" ]; then
-              echo "action=skip" >> "${GITHUB_OUTPUT}"
-            else
-              echo "action=docs-only" >> "${GITHUB_OUTPUT}"
-            fi
-          fi
-      - name: Publish (new version)
-        if: steps.hex.outputs.action == 'publish'
+          bash .github/scripts/hex-upload-state.sh "${VERSION}" "$(cat /tmp/archive.sha256)" >> "${GITHUB_OUTPUT}"
+      - name: Actions summary
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+          MERGE_SHA: ${{ github.sha }}
+          ACTION: ${{ steps.hex.outputs.action }}
+          APPROVAL_URL: ${{ steps.hex.outputs.approval_url }}
+        run: |
+          set -euo pipefail
+          {
+            printf '### Hex release — %s for %s\n' "${ACTION}" "${VERSION}"
+            echo ""
+            echo "- Staged-release dashboard (approve staged package/docs here): https://hex.pm/dashboard/staged-releases"
+          } >> "${GITHUB_STEP_SUMMARY}"
+          case "${ACTION}" in
+            bootstrap)
+              {
+                echo ""
+                printf 'The %s release is not public yet. CI is waiting read-only; it does not upload.\n' "${VERSION}"
+                echo ""
+                printf 'Merge SHA (exact commit to publish from locally): %s\n' "${MERGE_SHA}"
+                echo ""
+                echo "To finish the bootstrap, work locally from the exact merge commit and follow .github/release-runbook.md:"
+                echo "1. Use a short-lived *local personal* Hex API key with API Read and Publish only."
+                echo '2. Run mix hex.publish interactively with HEX_API_KEY set for that command only.'
+                echo '3. Select the upmaru public owner at the prompt.'
+                echo "4. Approve the staged release on the dashboard, then revoke the key."
+                echo "CI waits for the release and docs to go public, then verifies and resumes."
+              } >> "${GITHUB_STEP_SUMMARY}"
+              ;;
+            wait-staged)
+              {
+                echo ""
+                printf 'A staged release is pending approval. Approve it here: %s\n' "${APPROVAL_URL:-https://hex.pm/dashboard/staged-releases}"
+                echo "CI waits for the release and docs to go public, then verifies and resumes."
+              } >> "${GITHUB_STEP_SUMMARY}"
+              ;;
+            upload|docs-only|skip)
+              : # no extra summary content needed
+              ;;
+            *)
+              echo "" >> "${GITHUB_STEP_SUMMARY}"
+              echo "Unknown action ${ACTION}; see the run log." >> "${GITHUB_STEP_SUMMARY}"
+              ;;
+          esac
+      - name: Upload (new version)
+        if: steps.hex.outputs.action == 'upload'
+        timeout-minutes: 60
         run: mise exec -- mix hex.publish --yes --wait
       - name: Docs-only recovery
         if: steps.hex.outputs.action == 'docs-only'
+        timeout-minutes: 60
         run: mise exec -- mix hex.publish docs --yes --wait
       - name: Verify the public release
         env:
           VERSION: ${{ needs.verify.outputs.version }}
+          ACTION: ${{ steps.hex.outputs.action }}
+          APPROVAL_URL: ${{ steps.hex.outputs.approval_url }}
+          ATTEMPTS: ${{ steps.hex.outputs.verify_attempts }}
+          INTERVAL: ${{ steps.hex.outputs.verify_interval }}
         run: |
           set -euo pipefail
           version="${VERSION}"
           our=$(cat /tmp/archive.sha256)
-          for attempt in $(seq 1 8); do
+          attempts="${ATTEMPTS:-8}"
+          interval="${INTERVAL:-10}"
+          deadline=""
+          if [ "${ACTION}" = "bootstrap" ] || [ "${ACTION}" = "wait-staged" ]; then
+            deadline=3600
+          fi
+          code="000"
+          live=0
+          for attempt in $(seq 1 "${attempts}"); do
             code=$(curl -sS --connect-timeout 10 --max-time 60 -o /tmp/rel.json -w '%{http_code}' "https://hex.pm/api/packages/${HEX_PACKAGE}/releases/${version}" 2>/dev/null) || code="000"
             if [ "${code}" = "200" ]; then
-              checksum=$(jq -r '.checksum | select(type == "string" and length > 0)' /tmp/rel.json)
-              has_docs=$(jq -r '.has_docs | select(type == "boolean")' /tmp/rel.json)
+              checksum=$(jq -r '.checksum | select(type == "string" and length > 0)' /tmp/rel.json 2>/dev/null) || checksum=""
+              has_docs=$(jq -r '.has_docs | select(type == "boolean")' /tmp/rel.json 2>/dev/null) || has_docs=""
               if [ -n "${checksum}" ] && [ -n "${has_docs}" ]; then
                 echo "Public checksum: ${checksum} (built: ${our})"
                 echo "Public has_docs: ${has_docs}"
-                if [ "${checksum}" = "${our}" ] && [ "${has_docs}" = "true" ]; then
-                  exit 0
+                if [ "${checksum}" != "${our}" ]; then
+                  echo "Public release checksum ${checksum} does not match this build (${our}); refusing to continue" >&2
+                  exit 1
                 fi
+                if [ "${has_docs}" = "true" ]; then
+                  live=1
+                  break
+                fi
+                echo "Public release is live but docs are not published yet (has_docs=${has_docs})"
               fi
             fi
-            echo "Public release not live (attempt ${attempt}/8, status ${code}); retrying in 10s"
-            sleep 10
+            if [ -n "${deadline}" ] && [ "${SECONDS}" -ge "${deadline}" ]; then
+              echo "Reached ~1-hour deadline after ${attempt} attempt(s)"
+              break
+            fi
+            echo "Public release not live (attempt ${attempt}/${attempts}, status ${code}); retrying in ${interval}s"
+            sleep "${interval}"
           done
+          if [ "${live}" -eq 1 ]; then
+            exit 0
+          fi
           echo "Public release for ${HEX_PACKAGE} ${version} is not live yet." >&2
           if [ "${code}" != "200" ]; then
             echo "Last status: ${code}" >&2
           fi
-          echo "Check the Hex dashboard / staged-docs approval, then rerun the workflow (existing correct tag/release are safe to resume). Do not use --replace." >&2
+          case "${ACTION}" in
+            bootstrap)
+              echo "Finish the bootstrap locally from the exact merge commit (see .github/release-runbook.md), e.g. follow the instructions in the job summary, then rerun this workflow." >&2
+              ;;
+            wait-staged)
+              echo "Approve the staged release: ${APPROVAL_URL:-https://hex.pm/dashboard/staged-releases}" >&2
+              echo "After approval, rerun this workflow." >&2
+              ;;
+            upload|docs-only)
+              echo "Check the Hex dashboard / staged-docs approval, then rerun this workflow (an existing correct tag/release are safe to resume). Do not use --replace." >&2
+              ;;
+            *)
+              echo "Check the Hex dashboard / staged-docs approval, then rerun this workflow. Do not use --replace." >&2
+              ;;
+          esac
           exit 1
 
   release:
