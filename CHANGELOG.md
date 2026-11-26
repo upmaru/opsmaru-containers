@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- `Docker.CowboyHandler` forwards repeated `X-Docker-Expose-Session-Grpc-Method`
+  request headers as separate headers. Cowboy joins repeated headers into one
+  value, which hid every BuildKit session method from dockerd, so
+  `docker buildx build` with the Docker driver failed with
+  `no local sources enabled`. Found by Macus's qualification spike on an
+  owner-private Unix socket.
+
 ## 0.2.0 — 2026-11-26
 
 - Split `Raw.relay/4` into `Raw.open/3` and `Raw.run/4` for listeners that
