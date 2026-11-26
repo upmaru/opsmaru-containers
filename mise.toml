@@ -1,6 +1,7 @@
 [tools]
 elixir = "1.19.5-otp-27"
 erlang = "27.3.4.16"
+go = "1.25.14"
 # Used by .github/scripts/hex-upload-state.sh and its regression tests.
 jq = "1.8.2"
 node = "26.10.0"
@@ -22,8 +23,12 @@ run = "mix docker.reference --check"
 description = "Build the Hex artifact and check fresh consumers with and without the web stack"
 run = "sh test/acceptance/hex_consumers.sh"
 
+[tasks."check:bridge"]
+description = "Vet, test and reproducibly build the packaged exec bridge helper"
+run = "sh scripts/check_bridge.sh"
+
 [tasks.check]
-description = "Format, compile, strict Credo and library/fixture tests; no real backend"
+description = "Format, compile, strict Credo, library/fixture tests and the bridge helper; no real backend"
 run = [
   "mix format --check-formatted",
   "mix compile --warnings-as-errors",
@@ -31,4 +36,5 @@ run = [
   "MIX_ENV=test mix do compile --warnings-as-errors + test --warnings-as-errors",
   "mix docker.reference --check",
   "openspec validate --all --strict --no-interactive",
+  "sh scripts/check_bridge.sh",
 ]

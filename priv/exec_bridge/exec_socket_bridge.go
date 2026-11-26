@@ -1,4 +1,4 @@
-// exec_socket_bridge is a guest-side candidate for the Incus exec dialer.
+// exec_socket_bridge is the guest-side helper for Transport.ExecBridge.
 // Stdin carries bytes to the Unix peer. Stdout starts with OCB1, followed by
 // frames with a one-byte type and a four-byte big-endian length. Type 0 carries
 // at most 16 KiB of data. Type 1 carries no bytes and ends the output only.

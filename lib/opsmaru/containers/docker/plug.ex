@@ -12,13 +12,14 @@ if Code.ensure_loaded?(Plug.Conn) do
     """
 
     @behaviour Plug
-    alias Opsmaru.Containers.Docker.{Admission, BindPolicy, HTTP}
+    alias Opsmaru.Containers.Docker.{Admission, BindPolicy, Exchange, HTTP}
     alias Opsmaru.Containers.Transport
     alias Opsmaru.Containers.Transport.Stream
 
     @chunk_bytes 65_536
     @max_checked_body 1_048_576
     @guarded_paths ["/containers/create", "/volumes/create", "/exec/{name:.*}/start"]
+    @exchange_key {__MODULE__, :exchange}
 
     @impl Plug
     def init(options) do
@@ -31,6 +32,49 @@ if Code.ensure_loaded?(Plug.Conn) do
 
     @impl Plug
     def call(conn, options) do
+      exchange =
+        Exchange.start(%{
+          adapter: :plug,
+          host: options.host,
+          method: conn.method,
+          peer_address: conn.remote_ip
+        })
+
+      Process.put(@exchange_key, exchange)
+
+      try do
+        serve(conn, options)
+      catch
+        kind, reason ->
+          # A crash that no path classified ends the exchange without
+          # finishing it. Response writes record `:caller_closed` themselves,
+          # and an earlier recorded reason still wins.
+          interrupt_current_exchange(:killed)
+          :erlang.raise(kind, reason, __STACKTRACE__)
+      after
+        exchange = Process.get(@exchange_key)
+        Process.delete(@exchange_key)
+        Exchange.finish(exchange)
+      end
+    end
+
+    defp interrupt_current_exchange(reason) do
+      exchange = current_exchange()
+
+      if exchange,
+        do: Process.put(@exchange_key, Exchange.interrupt(exchange, reason))
+    end
+
+    # A response write that raises or exits means the client went away.
+    defp write_response(fun) do
+      fun.()
+    catch
+      kind, reason ->
+        interrupt_current_exchange(:caller_closed)
+        :erlang.raise(kind, reason, __STACKTRACE__)
+    end
+
+    defp serve(conn, options) do
       deadline = now() + options.admission
 
       request = %{
@@ -42,11 +86,13 @@ if Code.ensure_loaded?(Plug.Conn) do
       }
 
       with {:ok, admission} <- Admission.admit(options.host, request, deadline),
+           _ <- Exchange.admit_route(current_exchange(), admission.route, conn.request_path),
            :ok <- regular_request(conn, admission.route),
            {:ok, conn, body, framing} <- prepare_body(conn, options.host, admission, deadline) do
         relay(conn, admission, body, framing, now() + options.stream)
       else
-        {:error, status, message} -> error(conn, status, message)
+        {:error, status, message} ->
+          error(conn, status, message, Exchange.refusal_reason(status, message))
       end
     end
 
@@ -63,6 +109,7 @@ if Code.ensure_loaded?(Plug.Conn) do
     defp prepare_body(conn, host, %{route: %{"path" => path}} = admission, deadline)
          when path in @guarded_paths do
       with {:ok, bytes, conn} <- read_checked_body(conn),
+           _ <- Exchange.request_bytes(current_exchange(), byte_size(bytes)),
            :ok <- detached_exec(path, bytes),
            {:ok, bytes} <- BindPolicy.apply(host, admission, bytes, deadline) do
         {:ok, conn, bytes, {:length, byte_size(bytes)}}
@@ -128,6 +175,8 @@ if Code.ensure_loaded?(Plug.Conn) do
 
       case Transport.dial(context.dialer, context.target, deadline) do
         {:ok, stream} ->
+          Exchange.sent(current_exchange(), Exchange.dialed_outcome(conn.method))
+
           try do
             with_client_monitor(conn, fn monitor ->
               exchange(conn, admission, stream, body, framing, deadline, monitor)
@@ -137,7 +186,7 @@ if Code.ensure_loaded?(Plug.Conn) do
           end
 
         {:error, _} ->
-          error(conn, 503, "Docker engine is not ready")
+          error(conn, 503, "Docker engine is not ready", :engine_unavailable)
       end
     end
 
@@ -162,7 +211,7 @@ if Code.ensure_loaded?(Plug.Conn) do
           |> respond_to_exchange(admission, monitor)
 
         {:error, _} ->
-          error(conn, 502, "Docker engine connection failed")
+          error(conn, 502, "Docker engine connection failed", :upstream_failed)
       end
     end
 
@@ -170,7 +219,7 @@ if Code.ensure_loaded?(Plug.Conn) do
       do: respond(conn, response, admission, monitor)
 
     defp respond_to_exchange({conn, {:error, _}}, _, _),
-      do: error(conn, 502, "Docker engine connection failed")
+      do: error(conn, 502, "Docker engine connection failed", :upstream_failed)
 
     defp request_body(conn, stream, _, :none, deadline, monitor) do
       {conn,
@@ -227,6 +276,8 @@ if Code.ensure_loaded?(Plug.Conn) do
     defp forward_upload(conn, upload, remaining, status, bytes) do
       case consume(remaining, bytes) do
         {:ok, remaining} ->
+          Exchange.request_bytes(current_exchange(), byte_size(bytes))
+
           sender = fn ->
             HTTP.send_chunk(upload.stream, bytes, upload.framing, upload.deadline)
           end
@@ -255,8 +306,12 @@ if Code.ensure_loaded?(Plug.Conn) do
       conn = close_after_response(conn)
 
       case wait_for_io(upload.reader, nil, upload.monitor, 0) do
-        {:response, result} -> {:response, result, conn}
-        :pending -> {:response, {:error, :invalid_request_length}, conn}
+        {:response, result} ->
+          {:response, result, conn}
+
+        :pending ->
+          Exchange.interrupt(current_exchange(), :invalid_request)
+          {:response, {:error, :invalid_request_length}, conn}
       end
     end
 
@@ -297,10 +352,15 @@ if Code.ensure_loaded?(Plug.Conn) do
       receive do
         {^reader, result} -> {:response, result}
         {^writer, result} when is_reference(writer) -> {:sent, result}
-        {:DOWN, ^monitor, :process, _, _} -> exit(:shutdown)
+        {:DOWN, ^monitor, :process, _, _} -> caller_closed()
       after
         timeout -> :pending
       end
+    end
+
+    defp caller_closed do
+      Exchange.interrupt(current_exchange(), :caller_closed)
+      exit(:shutdown)
     end
 
     defp with_task(fun, handle) do
@@ -335,23 +395,28 @@ if Code.ensure_loaded?(Plug.Conn) do
     defp consume(_, _), do: {:error, :invalid_request_length}
 
     defp respond(conn, response, admission, monitor) do
+      Exchange.sent(current_exchange(), :sent)
       caps = admission.context.capabilities
       rewrite? = caps.maximum != admission.maximum or caps.minimum != admission.minimum
       version? = admission.route["path"] == "/version" and response.status == 200
 
       cond do
         response.mode in [:complete, {:length, 0}] ->
-          conn
-          |> response_headers(response, admission, true)
-          |> Plug.Conn.send_resp(response.status, "")
+          Exchange.commit(current_exchange(), response.status)
+
+          conn = response_headers(conn, response, admission, true)
+          write_response(fn -> Plug.Conn.send_resp(conn, response.status, "") end)
 
         version? and rewrite? ->
           respond_version(conn, response, admission, monitor)
 
         true ->
-          conn
-          |> response_headers(response, admission, false)
-          |> Plug.Conn.send_chunked(response.status)
+          Exchange.commit(current_exchange(), response.status)
+
+          conn = response_headers(conn, response, admission, false)
+
+          fn -> Plug.Conn.send_chunked(conn, response.status) end
+          |> write_response()
           |> stream_response(response, monitor)
       end
     end
@@ -367,9 +432,12 @@ if Code.ensure_loaded?(Plug.Conn) do
           |> Map.merge(%{"ApiVersion" => admission.maximum, "MinAPIVersion" => admission.minimum})
           |> Jason.encode!()
 
-        conn |> response_headers(response, admission, false) |> Plug.Conn.send_resp(200, body)
+        Exchange.commit(current_exchange(), 200)
+        Exchange.response_bytes(current_exchange(), byte_size(body))
+        conn = response_headers(conn, response, admission, false)
+        write_response(fn -> Plug.Conn.send_resp(conn, 200, body) end)
       else
-        _ -> error(conn, 502, "Invalid Docker engine version response")
+        _ -> error(conn, 502, "Invalid Docker engine version response", :upstream_failed)
       end
     end
 
@@ -389,24 +457,41 @@ if Code.ensure_loaded?(Plug.Conn) do
     defp stream_response(conn, response, monitor) do
       case read_engine(monitor, response.deadline, fn -> HTTP.next(response) end) do
         {:ok, bytes, response} ->
-          case Plug.Conn.chunk(conn, bytes) do
-            {:ok, conn} -> stream_response(conn, response, monitor)
-            {:error, _} -> conn
+          case chunk(conn, bytes) do
+            {:ok, conn} ->
+              Exchange.response_bytes(current_exchange(), byte_size(bytes))
+              stream_response(conn, response, monitor)
+
+            {:error, _} ->
+              Exchange.interrupt(current_exchange(), :caller_closed)
+              conn
           end
 
         :eof ->
           conn
 
-        {:error, _} ->
+        {:error, reason} ->
+          Exchange.interrupt(
+            current_exchange(),
+            if(reason == :deadline, do: :deadline, else: :backend_closed)
+          )
+
           raise "Docker upstream response ended before completion"
       end
     end
 
-    defp error(conn, status, message) do
-      conn
-      |> Plug.Conn.put_resp_content_type("application/json")
-      |> Plug.Conn.send_resp(status, Jason.encode!(%{message: message}))
+    defp chunk(conn, bytes), do: write_response(fn -> Plug.Conn.chunk(conn, bytes) end)
+
+    defp error(conn, status, message, reason) do
+      body = Jason.encode!(%{message: message})
+      Exchange.commit(current_exchange(), status, reason)
+      Exchange.response_bytes(current_exchange(), byte_size(body))
+
+      conn = Plug.Conn.put_resp_content_type(conn, "application/json")
+      write_response(fn -> Plug.Conn.send_resp(conn, status, body) end)
     end
+
+    defp current_exchange, do: Process.get(@exchange_key)
 
     defp append_query(path, ""), do: path
     defp append_query(path, raw_query), do: path <> "?" <> raw_query

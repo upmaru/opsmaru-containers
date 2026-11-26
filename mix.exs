@@ -1,7 +1,7 @@
 defmodule OpsmaruContainers.MixProject do
   use Mix.Project
 
-  @version "0.1.0"
+  @version "0.2.0"
   @source_url "https://github.com/upmaru/opsmaru-containers"
 
   def project do
@@ -10,6 +10,7 @@ defmodule OpsmaruContainers.MixProject do
       version: @version,
       elixir: "~> 1.19",
       start_permanent: false,
+      elixirc_paths: elixirc_paths(Mix.env()),
       deps: deps(),
       description: "Container engine APIs (Docker first) served from Incus through opsmaru_incus",
       source_url: @source_url,
@@ -18,6 +19,9 @@ defmodule OpsmaruContainers.MixProject do
       docs: docs()
     ]
   end
+
+  defp elixirc_paths(:test), do: ["lib", "test/support"]
+  defp elixirc_paths(_), do: ["lib"]
 
   # A pure library: no application callback, so loading or starting it
   # never creates processes, listeners, state or backend connections.
@@ -44,10 +48,12 @@ defmodule OpsmaruContainers.MixProject do
     [
       # The only route to Incus. This library never opens its own backend
       # connection; hosts pass opsmaru_incus connections on every call.
-      {:opsmaru_incus, "~> 0.2.9"},
+      {:opsmaru_incus, "~> 0.2.10"},
       {:jason, "~> 1.4"},
       {:yamerl, "~> 0.10"},
+      {:telemetry, "~> 1.3", optional: true},
       {:plug, "~> 1.16", optional: true, runtime: false},
+      {:plug_cowboy, "~> 2.7", only: :test},
       {:cowboy, "~> 2.12", optional: true, runtime: false},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
       {:ex_doc, "~> 0.40", only: :dev, runtime: false}
