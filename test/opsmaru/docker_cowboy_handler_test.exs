@@ -88,6 +88,13 @@ defmodule Opsmaru.Containers.Docker.CowboyHandlerTest do
     refute_receive {:docker_event, _, _, _}, 100
   end
 
+  defp recv_until(_socket, remaining) when remaining <= 0, do: ""
+
+  defp recv_until(socket, remaining) do
+    {:ok, data} = :ssl.recv(socket, remaining, 5_000)
+    data
+  end
+
   describe "2.1 compiled with :cowboy_req" do
     test "the handler, tunnel and stream modules are loaded" do
       assert Code.ensure_loaded?(Opsmaru.Containers.Docker.CowboyHandler)
@@ -578,7 +585,8 @@ defmodule Opsmaru.Containers.Docker.CowboyHandlerTest do
       :ok = :ssl.send(socket, request("POST", "/session", headers))
       assert_receive {:dialed, _relay}, 2_000
 
-      {backend, head, _body, _rest} = accept_upgrade(engine, "")
+      backend = EngineFixture.accept(engine)
+      {head, _body, _rest} = EngineFixture.read_request(backend)
 
       forwarded =
         for line <- String.split(head, "\r\n"),
@@ -588,6 +596,24 @@ defmodule Opsmaru.Containers.Docker.CowboyHandlerTest do
 
       assert forwarded == methods
       assert head =~ "\r\nx-docker-expose-session-uuid: s1"
+
+      # The engine accepts the session as dockerd does, and the upgrade
+      # completes end to end.
+      :ok =
+        :gen_tcp.send(
+          backend,
+          "HTTP/1.1 101 UPGRADED\r\nConnection: Upgrade\r\nUpgrade: h2c\r\n\r\nengine-h2"
+        )
+
+      {client_head, client_rest} = CowboyFixture.recv_head(:ssl, socket)
+      assert client_head =~ ~r/\AHTTP\/1\.1 101 Switching Protocols\r\n/
+      assert client_head =~ "\r\nupgrade: h2c"
+
+      assert client_rest <> recv_until(socket, byte_size("engine-h2") - byte_size(client_rest)) ==
+               "engine-h2"
+
+      :ok = :ssl.send(socket, "client-h2")
+      assert {:ok, "client-h2"} = :gen_tcp.recv(backend, byte_size("client-h2"), 5_000)
 
       :ssl.close(socket)
       :gen_tcp.close(backend)
