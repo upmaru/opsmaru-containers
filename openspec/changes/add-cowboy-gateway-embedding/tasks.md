@@ -88,10 +88,11 @@ Evidence classes stay distinct. Fixture and TLS-fixture tests prove library beha
   Run `mise run check:consumer`.
 - [x] 5.2 Run `mise run check`, `mise run check:reference` and `mise exec -- openspec validate --all --strict --no-interactive`.
 - [x] 5.3 Add the 0.2.0 `CHANGELOG.md` entry. List the split raw API, the Cowboy handler with its 101 reason phrase and TLS half-close limitation, the packaged exec bridge with its qualified stack and open stall, telemetry, and the dependency floor.
-- [ ] 5.4 With user authorization, finish this feature into develop, cut `release/0.2.0` from develop after the `release/0.1.0` back-merge is on develop, and publish 0.2.0 to Hex through the existing release workflow. Do not tag, finish or publish without that authorization.
+- [x] 5.4 With user authorization, finish this feature into develop, cut `release/0.2.0` from develop after the `release/0.1.0` back-merge is on develop, and publish 0.2.0 to Hex through the existing release workflow. Do not tag, finish or publish without that authorization.
   - `opsmaru_incus ~> 0.2.10` is in `mix.exs`. `mise run check:consumer` passed on 2026-11-26 with both consumers verified.
   - `mise run check` passed on 2026-11-26: format, compile, strict Credo, 106 fixture tests including the Go TLS client, the reference check, strict OpenSpec validation and `check:bridge`. `check:reference` passed on its own as well.
   - The 0.2.0 entry is in `CHANGELOG.md` as unreleased. Per the release runbook, `@version` is bumped on `release/0.2.0`, not here.
+  - Released on 2026-11-26 with user authorization. `release/0.2.0` merged into `main` through upmaru/opsmaru-containers#8 (merge commit `c5623b9`) and into `develop` (`fdb9857`), tagged `v0.2.0`. The release workflow published 0.2.0 with docs to Hex after staged approval. The public Hex checksum `e2e27dc732c3efe35b6a09dc5e78f1c4cbf6681b6ae522c7d12eeeea5687d510` matches the workflow's build. Tasks 2.5 and 3.5 were still open at release, as the 0.2.0 changelog entry states.
 - [x] 5.5 Record that this change adds fixture, TLS-fixture and packaged-consumer evidence, plus the task 3.5 real-Incus evidence only if it was run. Record that Macus consumer acceptance stays open as task 4.5 of `add-docker-engine-foundation`, to be recorded when Macus serves Docker on its gateway with its own listener, engine image, path mapping and docker context.
   - Recorded on 2026-11-26. This change adds:
     - fixture evidence (the split raw entry, the exec bridge against a scripted session, telemetry);
