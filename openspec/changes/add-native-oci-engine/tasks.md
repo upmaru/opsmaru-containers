@@ -4,14 +4,24 @@
 
 Run every item against an isolated Incus 7.0.1 project with `instance_oci` and skopeo, using images built and pulled by the pinned nested engine. Record commands, outputs and verdicts in `docs/native-oci-spike.md`. Translation tasks 3 to 6 start only after these are recorded.
 
-- [ ] 1.1 Entrypoint: the format of `oci.entrypoint` (single string or list, quoting), whether it and `oci.cwd`, `oci.uid`, `oci.gid` and `environment.*` set at create override the image config, and how Docker's `Entrypoint` plus `Cmd` arrays survive arguments with spaces and quotes.
-- [ ] 1.2 **Gate:** whether Incus records the entrypoint's exit status (instance state, a volatile key, a lifecycle event or operation metadata) for exit codes 0, 3 and 137, and how soon after exit. If it does not, return this change to planning.
-- [ ] 1.3 Image handoff: try candidate A (an HTTPS registry in the engine instance with a pinned certificate, as an `oci` source) and candidate B (export from dockerd, convert in the engine instance, upload through `POST /1.0/images`). Record the time and bytes over the host path for a 10 MiB and a 500 MiB image, and the resulting image's config. Choose one in the design.
-- [ ] 1.4 Output and console: whether the console log separates stdout and stderr, carries timestamps, survives restart, and can be followed without taking the console. Whether a console attach can carry stdin and a TTY for `docker run -it`.
-- [ ] 1.5 Stop and signals: the signal a graceful Incus stop sends to an OCI container, whether the entrypoint is PID 1, and whether `kill -TERM 1` through exec reaches it.
-- [ ] 1.6 Freeze and unfreeze on a running OCI container.
-- [ ] 1.7 Exec: half-close of Incus exec stdin with output continuing, separate stdout and stderr, exit codes, TTY resize, and numeric user and working directory.
-- [ ] 1.8 Networking: whether a managed bridge's DNS resolves OCI instance names, and what `NetworkMode=none` needs (no `nic` device, or a profile without one).
+**Result (2026-11-27): gate 1.2 failed, and this change is back in planning.** Tasks 2 to 6 below describe the original design and do not start until a revised design passes task 1 again.
+
+- [x] 1.1 Entrypoint: the format of `oci.entrypoint` (single string or list, quoting), whether it and `oci.cwd`, `oci.uid`, `oci.gid` and `environment.*` set at create override the image config, and how Docker's `Entrypoint` plus `Cmd` arrays survive arguments with spaces and quotes.
+  - Run 2026-11-27 ([spike report](../../../docs/native-oci-spike.md)). One shell-like string with no variable expansion, overriding the image, and create-time `oci.cwd`, `oci.uid`, `oci.gid` and `environment.*` override too. Arguments containing `$ \ | [ * ~ '` can gain backslashes, so Docker's argv cannot be carried exactly.
+- [x] 1.2 **Gate:** whether Incus records the entrypoint's exit status (instance state, a volatile key, a lifecycle event or operation metadata) for exit codes 0, 3 and 137, and how soon after exit. If it does not, return this change to planning.
+  - **Gate fails** (2026-11-27). Exits 0, 3 and 137 are indistinguishable in instance state, config, lifecycle events and `lxc.log`. This change returns to planning.
+- [x] 1.3 Image handoff: try candidate A (an HTTPS registry in the engine instance with a pinned certificate, as an `oci` source) and candidate B (export from dockerd, convert in the engine instance, upload through `POST /1.0/images`). Record the time and bytes over the host path for a 10 MiB and a 500 MiB image, and the resulting image's config. Choose one in the design.
+  - Candidate B works: 10 MiB in 2.0 s, 500 MiB in 31.1 s, an OCI container running the image's own command. Candidate A fails: the Incus server's `skopeo inspect` ignores the pinned certificate.
+- [x] 1.4 Output and console: whether the console log separates stdout and stderr, carries timestamps, survives restart, and can be followed without taking the console. Whether a console attach can carry stdin and a TTY for `docker run -it`.
+  - The console log merges stdout and stderr, has no timestamps, is empty or partial while running, complete after stop, and cleared on restart. Console attach needs a terminal. Not usable for `logs` or `attach`.
+- [x] 1.5 Stop and signals: the signal a graceful Incus stop sends to an OCI container, whether the entrypoint is PID 1, and whether `kill -TERM 1` through exec reaches it.
+  - `incus stop` sends SIGTERM to the entrypoint, which is PID 4 under `{incusd} init` (PID 1). `kill` through exec must target the entrypoint's PID, not 1.
+- [x] 1.6 Freeze and unfreeze on a running OCI container.
+  - Freeze and unfreeze work.
+- [x] 1.7 Exec: half-close of Incus exec stdin with output continuing, separate stdout and stderr, exit codes, TTY resize, and numeric user and working directory.
+  - Pass: stdin EOF, separate stdout and stderr, exit code, numeric user and group, cwd, env, 1 MiB stdin and TTY size.
+- [x] 1.8 Networking: whether a managed bridge's DNS resolves OCI instance names, and what `NetworkMode=none` needs (no `nic` device, or a profile without one).
+  - The bridge resolves OCI instance names. An `eth0` device of type `none` leaves only `lo`.
 
 ## 2. Route table and host contract
 

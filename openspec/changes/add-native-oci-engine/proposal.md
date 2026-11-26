@@ -15,6 +15,8 @@ Docker's image work (pull, build, tag, push, BuildKit) has no Incus equivalent, 
 - **A checked translation table.** Every `containers/create` field has one recorded class: translated to an Incus key or device, ignored with a reason, or refused. Unknown fields with non-default values are refused. Container routes record whether they are translated or refused for native containers.
 - **Qualification before translation.** A spike against Incus 7.0.1 settles what the docs leave open: the entrypoint format, whether the entrypoint's exit status is observable, how its output is captured, stop signals, freeze, exec half-close, and how an image moves from dockerd to Incus. If the exit status cannot be observed, `docker run` and `docker wait` cannot report exit codes, and this change returns to planning.
 
+- **Back in planning (2026-11-27).** The task 1 spike found that Incus 7.0.1 does not record the entrypoint's exit status. It also found that `oci.entrypoint` does not carry arbitrary argv exactly, and that the console log cannot serve `docker logs`. Image handoff by export, convert and upload works. The spike also tested the pieces a packaged init shim would need, and they work. A revised design chooses that next. See [the spike report](../../../docs/native-oci-spike.md).
+
 Not in this change:
 
 - Native image pull, build or push, and a single image store shared without copies.

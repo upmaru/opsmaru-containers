@@ -196,6 +196,14 @@ Evidence for a native route needs:
 - **[Incus key limits]** → `oci.*` keys are not live-updatable, so `docker update` stays refused for native containers.
 - **[Larger trust boundary for the host]** → Native containers are full Incus instances in a host-chosen project. The host's authorization and its project configuration (profiles, limits, network) bound what a Docker client can create there.
 
-## Open Questions
+## Spike result (2026-11-27)
 
-Task 1 owns these: the entrypoint format, exit status, output capture and follow, console attach, stop signal and PID 1, freeze, DNS by instance name, and the image handoff choice.
+The task 1 spike ([report](../../../docs/native-oci-spike.md)) failed gate 1.2, so this design is back in planning. What it changes:
+
+- **Exit status:** Incus 7.0.1 records none. Decision 7's wait cannot be built on Incus state or events.
+- **Argv:** `oci.entrypoint` alters some arguments containing shell metacharacters, so decision 6's `Entrypoint` and `Cmd` translation cannot be exact through that key.
+- **Logs:** the console log merges streams, has no timestamps, is unreliable while running and is cleared on restart. Decision 9 cannot be built on it.
+- **Image handoff:** decision 2 resolves to candidate B. Candidate A fails, because Incus does not pass the pinned certificate to skopeo.
+- **Unchanged and confirmed:** graceful stop sends SIGTERM to the entrypoint. Signals other than that must target the entrypoint's PID, because PID 1 is Incus's init. Freeze, exec (decision 8), DNS by instance name and `NetworkMode=none` all work.
+
+The direction to evaluate next is a packaged init shim, built and released like the exec bridge helper. It would be pushed through the files API into each native container before first start, which the spike confirmed works, and set as the entrypoint. It would read the exact argv from a file, forward signals to its child, and write the exit status, the exit time, and separate timestamped stdout and stderr files to the container's rootfs, readable through the files API after stop (also confirmed). That would cover 1.1, 1.2 and 1.4 without Incus changes. The cost is that every native container runs a library-supplied PID-4 process, and logs grow on the container's disk.
