@@ -25,6 +25,20 @@ defmodule Opsmaru.Containers.TestSupport.FakeExecIncus do
   @doc "Make the next exec in this process fail with `reason`."
   def fail_exec(reason), do: Process.put({__MODULE__, :session}, {:error, reason})
 
+  @doc """
+  Like fail_exec/1, but reports the calling process to `observer` as
+  `{:incus, {:exec_failed, pid}}` before returning the failure.
+  """
+  def fail_exec(reason, observer) when is_pid(observer) do
+    Process.put({__MODULE__, :session}, {:error, reason, observer})
+  end
+
+  @doc """
+  Make the next exec in this process never return. The calling process is
+  reported to `session`'s observer as `{:incus, {:exec_stalled, pid}}`.
+  """
+  def stall_exec(session), do: Process.put({__MODULE__, :session}, {:stall, session})
+
   @doc "Queue an output item: `{:binary, bytes}` or `:closed`."
   def push(session, channel, item), do: GenServer.call(session, {:push, channel, item})
 
@@ -34,14 +48,37 @@ defmodule Opsmaru.Containers.TestSupport.FakeExecIncus do
 
   # --- ExecBridge.Incus functions ---------------------------------------------
 
+  # The bridge runs the exec in a setup process; the session selected by the
+  # dialing process is found through `$callers`.
   def exec(client, instance, request) do
-    case Process.get({__MODULE__, :session}) do
+    case selected() do
       {:error, reason} ->
         {:error, reason}
+
+      {:error, reason, observer} ->
+        send(observer, {:incus, {:exec_failed, self()}})
+        {:error, reason}
+
+      {:stall, session} ->
+        report(session, {:exec_stalled, self()})
+        Process.sleep(:infinity)
 
       session when is_pid(session) ->
         report(session, {:exec, client, instance, request})
         {:ok, session}
+    end
+  end
+
+  defp selected do
+    Enum.find_value([self() | Process.get(:"$callers", [])], fn pid ->
+      case Process.info(pid, :dictionary) do
+        {:dictionary, dictionary} -> List.keyfind(dictionary, {__MODULE__, :session}, 0)
+        nil -> nil
+      end
+    end)
+    |> case do
+      {_, selected} -> selected
+      nil -> nil
     end
   end
 

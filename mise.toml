@@ -2,6 +2,8 @@
 elixir = "1.19.5-otp-27"
 erlang = "27.3.4.16"
 go = "1.25.14"
+# Used by .github/scripts/hex-upload-state.sh and its regression tests.
+jq = "1.8.2"
 node = "26.10.0"
 "npm:@fission-ai/openspec" = "1.14.0"
 

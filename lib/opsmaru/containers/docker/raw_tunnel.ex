@@ -73,7 +73,7 @@ defmodule Opsmaru.Containers.Docker.RawTunnel do
         if prefix == "" do
           copy(source, destination, deadline, {recv_reason, send_reason}, {count, upload?})
         else
-          case Stream.send(destination, prefix, deadline) do
+          case guarded(fn -> Stream.send(destination, prefix, deadline) end) do
             :ok ->
               if not upload?, do: count.(byte_size(prefix), :tail)
               copy(source, destination, deadline, {recv_reason, send_reason}, {count, upload?})
@@ -91,7 +91,7 @@ defmodule Opsmaru.Containers.Docker.RawTunnel do
   end
 
   defp copy(source, destination, deadline, {recv_reason, _} = reasons, counter) do
-    case Stream.recv(source, @chunk_bytes, deadline) do
+    case guarded(fn -> Stream.recv(source, @chunk_bytes, deadline) end) do
       {:ok, data} when is_binary(data) and byte_size(data) in 1..@chunk_bytes ->
         forward(data, source, destination, deadline, reasons, counter)
 
@@ -109,7 +109,7 @@ defmodule Opsmaru.Containers.Docker.RawTunnel do
     {count, upload?} = counter
     if upload?, do: count.(byte_size(data), :data)
 
-    case Stream.send(destination, data, deadline) do
+    case guarded(fn -> Stream.send(destination, data, deadline) end) do
       :ok ->
         if not upload?, do: count.(byte_size(data), :data)
         copy(source, destination, deadline, reasons, counter)
@@ -120,10 +120,18 @@ defmodule Opsmaru.Containers.Docker.RawTunnel do
   end
 
   defp end_write(destination, deadline, {_, send_reason}) do
-    case Stream.shutdown_write(destination, deadline) do
+    case guarded(fn -> Stream.shutdown_write(destination, deadline) end) do
       :ok -> :ok
       error -> failure(error, send_reason, deadline)
     end
+  end
+
+  # An adapter call that raises, exits or throws fails the side it was made
+  # on, so a raising write blames the destination, not the source.
+  defp guarded(fun) do
+    fun.()
+  catch
+    _, _ -> {:error, :raised}
   end
 
   # An adapter's own `:deadline`, or a failure once the deadline has passed,

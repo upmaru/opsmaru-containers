@@ -342,6 +342,79 @@ defmodule Opsmaru.Containers.Transport.ExecBridgeTest do
     assert ExecBridge.recv(handle, 1_024, deadline()) == {:ok, "out"}
   end
 
+  test "an exec session setup that misses the dial deadline is abandoned" do
+    session = Fake.start(self())
+    Fake.stall_exec(session)
+    started = System.monotonic_time(:millisecond)
+
+    assert ExecBridge.dial(target(), options(), deadline(100)) == {:error, {:exec, :deadline}}
+    assert System.monotonic_time(:millisecond) - started < 1_000
+
+    # The setup process, which would own the session's channels, is gone.
+    assert_received {:incus, {:exec_stalled, holder}}
+    monitor = Process.monitor(holder)
+    assert_receive {:DOWN, ^monitor, :process, ^holder, reason}, 500
+    assert reason in [:killed, :noproc]
+  end
+
+  test "a dialing process that exits while exec is stalled stops the stalled exec" do
+    session = Fake.start(self())
+    test = self()
+
+    dialer =
+      spawn(fn ->
+        Fake.stall_exec(session)
+        ExecBridge.dial(target(), options(), deadline(5_000))
+        send(test, :dialed)
+      end)
+
+    assert_receive {:incus, {:exec_stalled, holder}}, 1_000
+
+    Process.exit(dialer, :kill)
+
+    monitor = Process.monitor(holder)
+    assert_receive {:DOWN, ^monitor, :process, ^holder, reason}, 500
+    assert reason in [:killed, :noproc]
+    refute_received :dialed
+  end
+
+  test "a failed exec leaves no holder behind" do
+    Fake.fail_exec(%Incus.Error{kind: :forbidden}, self())
+
+    assert {:error, {:exec, %Incus.Error{kind: :forbidden}}} =
+             ExecBridge.dial(target(), options(), deadline())
+
+    assert_received {:incus, {:exec_failed, holder}}
+    monitor = Process.monitor(holder)
+    assert_receive {:DOWN, ^monitor, :process, ^holder, _reason}, 500
+  end
+
+  test "the setup process holds the session until close releases it" do
+    {_session, handle} = connected("")
+    {holder, _ref} = handle.holder
+    assert Process.alive?(holder)
+
+    monitor = Process.monitor(holder)
+    assert ExecBridge.close(handle) == :ok
+    assert_receive {:DOWN, ^monitor, :process, ^holder, :normal}, 500
+  end
+
+  test "helper stderr is still drained after the dial deadline has passed" do
+    session = Fake.start(self(), stderr: [])
+    Fake.push(session, "1", {:binary, "OCB1"})
+    Fake.use_session(session)
+
+    {:ok, %Stream{adapter: ExecBridge, handle: handle}} =
+      ExecBridge.dial(target(), options(observer: self()), deadline(100))
+
+    Process.sleep(250)
+    Fake.push(session, "2", {:binary, "late warning"})
+    assert_receive {:helper_stderr, "late warning"}, 1_500
+
+    assert ExecBridge.close(handle) == :ok
+    refute Process.alive?(handle.stderr)
+  end
+
   defp collect(acc \\ []) do
     receive do
       {:incus, event} -> collect([event | acc])

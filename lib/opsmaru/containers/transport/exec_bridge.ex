@@ -42,6 +42,11 @@ defmodule Opsmaru.Containers.Transport.ExecBridge do
   Type 1 has length 0 and ends output only. Anything else is a stream error.
   The relay sees only peer bytes and directional EOF.
 
+  Creating the exec session and opening its channels ends by the dial
+  deadline. A setup that misses it is abandoned with
+  `{:error, {:exec, :deadline}}` and any channels it opened are closed. An
+  exec Incus already accepted is neither deleted nor retried.
+
   Closing a stream signals an incomplete helper with SIGTERM, waits up to
   three seconds and closes the session channels. It never sends an Incus
   DELETE and never retries.
@@ -81,12 +86,100 @@ defmodule Opsmaru.Containers.Transport.ExecBridge do
         "record-output" => false
       }
 
-      case opts.incus.exec(opts.client, target.instance, request) do
-        {:ok, session} -> start_stream(session, opts, deadline)
-        {:error, reason} -> {:error, {:exec, reason}}
+      case exec(opts, target.instance, request, deadline) do
+        {:ok, session, holder} -> start_stream(session, holder, opts, deadline)
+        {:error, _} = error -> error
       end
     end
   end
+
+  # --- Session setup ----------------------------------------------------------
+
+  # Creating the exec and opening its channels is bounded by the connection's
+  # own timeouts, which may outlast the dial deadline. Run it in a holder
+  # process and wait no longer than the deadline. The holder creates the
+  # channels, so it owns them: it lives until `close/1` releases it or the
+  # dialing process exits. A separate unlinked watcher monitors the dialing
+  # process from outside the blocking exec call, so a dialing process that
+  # exits while the exec is still running kills the holder and with it any
+  # channels it opened. A setup that misses the deadline is killed, which
+  # closes any channels it opened. An exec Incus already accepted is neither
+  # deleted nor retried.
+  defp exec(opts, instance, request, deadline) do
+    caller = self()
+    ref = make_ref()
+    callers = [caller | Process.get(:"$callers", [])]
+
+    holder =
+      spawn(fn ->
+        Process.put(:"$callers", callers)
+        result = guard(fn -> opts.incus.exec(opts.client, instance, request) end)
+        Kernel.send(caller, {ref, result})
+
+        # A failed setup must not linger: only a successful session is held.
+        case result do
+          {:ok, _session} -> hold(ref)
+          _ -> :ok
+        end
+      end)
+
+    spawn(fn -> watch_caller(caller, holder, callers) end)
+
+    monitor = Process.monitor(holder)
+
+    receive do
+      {^ref, {:ok, session}} ->
+        Process.demonitor(monitor, [:flush])
+        {:ok, session, {holder, ref}}
+
+      {^ref, {:error, reason}} ->
+        Process.demonitor(monitor, [:flush])
+        {:error, {:exec, reason}}
+
+      {^ref, other} ->
+        Process.demonitor(monitor, [:flush])
+        {:error, {:exec, other}}
+
+      {:DOWN, ^monitor, :process, ^holder, reason} ->
+        {:error, {:exec, reason}}
+    after
+      max(deadline - now(), 0) ->
+        Process.exit(holder, :kill)
+        Process.demonitor(monitor, [:flush])
+
+        receive do
+          {^ref, _} -> :ok
+        after
+          0 -> :ok
+        end
+
+        {:error, {:exec, :deadline}}
+    end
+  end
+
+  # Kills the holder (and with it any channels it opened) as soon as the
+  # dialing process exits, whatever the holder is doing. Exits when the
+  # holder dies on its own, which is how close/1 releases it.
+  defp watch_caller(caller, holder, callers) do
+    Process.put(:"$callers", callers)
+    caller_ref = Process.monitor(caller)
+    holder_ref = Process.monitor(holder)
+
+    receive do
+      {:DOWN, ^caller_ref, :process, _, _} -> Process.exit(holder, :kill)
+      {:DOWN, ^holder_ref, :process, _, _} -> :ok
+    end
+  end
+
+  defp hold(ref) do
+    receive do
+      {^ref, :release} -> :ok
+      _ -> hold(ref)
+    end
+  end
+
+  defp release(%{holder: {pid, ref}}), do: Kernel.send(pid, {ref, :release})
+  defp release(_), do: :ok
 
   # --- Options ----------------------------------------------------------------
 
@@ -189,7 +282,7 @@ defmodule Opsmaru.Containers.Transport.ExecBridge do
 
   # --- Setup ------------------------------------------------------------------
 
-  defp start_stream(session, opts, deadline) do
+  defp start_stream(session, holder, opts, deadline) do
     {:ok, buffer} = Agent.start_link(fn -> "" end)
 
     handle = %{
@@ -199,10 +292,19 @@ defmodule Opsmaru.Containers.Transport.ExecBridge do
       observer: opts.observer,
       limits: opts.limits,
       counters: :atomics.new(2, signed: false),
-      keepalive: nil
+      keepalive: nil,
+      stderr: nil,
+      holder: holder
     }
 
-    spawn_link(fn -> drain_stderr(handle, deadline) end)
+    # Stderr is drained for the life of the session, not until the dial
+    # deadline: a host may dial with a deadline far shorter than the stream
+    # (`Docker.CowboyHandler` passes its open deadline). The drain ends when
+    # channel 2 ends or fails, when `close/1` stops it, or within a second of
+    # the dialing process's exit. It is not linked, so stopping it from any
+    # process never takes the stream's owner down with it.
+    owner = self()
+    handle = %{handle | stderr: spawn(fn -> drain_stderr(handle, owner) end)}
 
     case take(handle, byte_size(@header), deadline) do
       {:ok, @header} ->
@@ -239,11 +341,22 @@ defmodule Opsmaru.Containers.Transport.ExecBridge do
     end
   end
 
-  defp drain_stderr(handle, deadline) do
-    case guard(fn -> output(handle, "2", deadline) end) do
-      {:ok, data} ->
+  defp drain_stderr(handle, owner) do
+    result =
+      if Process.alive?(owner),
+        do: guard(fn -> handle.incus.output(handle.session, "2", 1_000) end),
+        else: :owner_down
+
+    case result do
+      {:ok, {:binary, ""}} ->
+        drain_stderr(handle, owner)
+
+      {:ok, {:binary, data}} ->
         notify(handle, {:helper_stderr, data})
-        drain_stderr(handle, deadline)
+        drain_stderr(handle, owner)
+
+      {:error, %Error{kind: :deadline}} ->
+        drain_stderr(handle, owner)
 
       _ ->
         :ok
@@ -381,6 +494,7 @@ defmodule Opsmaru.Containers.Transport.ExecBridge do
   @impl Stream
   def close(handle) do
     if handle.keepalive, do: Process.exit(handle.keepalive, :kill)
+    stop_stderr(handle.stderr)
     %{incus: incus, session: session} = handle
 
     # Signal only a helper that is still running, wait a bounded time, then
@@ -391,9 +505,14 @@ defmodule Opsmaru.Containers.Transport.ExecBridge do
     end
 
     guard(fn -> incus.close(session) end)
+    release(handle)
     guard(fn -> Agent.stop(handle.buffer) end)
     :ok
   end
+
+  defp stop_stderr(pid) when is_pid(pid), do: Process.exit(pid, :kill)
+
+  defp stop_stderr(_), do: :ok
 
   defp guard(fun) do
     fun.()

@@ -5,7 +5,7 @@ if Code.ensure_loaded?(:cowboy_req) do
 
     Mount it as a Cowboy handler on a host-owned listener. It opens no
     listener, configures no TLS and starts no process before it receives a
-    request. Options:
+    request. Options, as a map or a keyword list:
 
       * `:host` (required) - the `Opsmaru.Containers.Host` policy module.
       * `:fallback` (required) - `{handler_module, handler_opts}` for every
@@ -18,7 +18,9 @@ if Code.ensure_loaded?(:cowboy_req) do
       * `:admission_timeout` - ms, default `1_000`: host policy, admission
         and reading the small request body.
       * `:dial_timeout` - ms, default `30_000`: the transport dial and the
-        upstream handshake.
+        upstream handshake. Policy, admission, the dial and the handshake
+        together end `admission_timeout + dial_timeout` after the request
+        reached the handler.
       * `:stream_timeout` - ms, default `86_400_000`: lifetime of one raw
         exchange.
       * `:handoff_timeout` - ms, default `5_000`: from the 101 cast to
@@ -81,12 +83,27 @@ if Code.ensure_loaded?(:cowboy_req) do
 
     @impl true
     def init(req, opts) do
+      opts = options(opts)
+
       case classify(req) do
         :fallback -> fallback(req, opts)
         :raw -> raw(req, opts)
         {:reject, message} -> refuse(req, opts, message)
       end
     end
+
+    # Cowboy dispatch passes handler options as written, and keyword lists
+    # are the usual form there.
+    defp options(opts) when is_map(opts), do: opts
+
+    defp options(opts) when is_list(opts) do
+      if Keyword.keyword?(opts),
+        do: Map.new(opts),
+        else: raise(ArgumentError, "Docker Cowboy handler options must be a map or keyword list")
+    end
+
+    defp options(_),
+      do: raise(ArgumentError, "Docker Cowboy handler options must be a map or keyword list")
 
     # --- Dispatch -------------------------------------------------------------
 
@@ -296,7 +313,9 @@ if Code.ensure_loaded?(:cowboy_req) do
         host: host,
         exchange: exchange,
         admission_deadline: started + limits.admission,
-        open_deadline: now() + limits.admission + limits.dial,
+        # Measured from the request's start, like the admission deadline, so
+        # the body read does not extend the open phase.
+        open_deadline: started + limits.admission + limits.dial,
         deadline: started + limits.stream,
         handoff: limits.handoff
       }
@@ -314,10 +333,18 @@ if Code.ensure_loaded?(:cowboy_req) do
           Process.demonitor(monitor, [:flush])
           switch(req, exchange, relay, ref, response)
 
+        {^ref, :caller_closed} ->
+          Process.demonitor(monitor, [:flush])
+          caller_closed(req, exchange)
+
         {:DOWN, ^monitor, :process, ^relay, _} ->
-          upstream_failure(req, exchange, :upstream_failed)
+          receive do
+            {^ref, :caller_closed} -> caller_closed(req, exchange)
+          after
+            0 -> upstream_failure(req, exchange, :upstream_failed)
+          end
       after
-        limits.admission + limits.dial + 100 ->
+        max(relay_opts.open_deadline - now(), 0) + 100 ->
           # The upstream request may already have been sent: record what the
           # relay saw and never retry.
           Process.exit(relay, :kill)
@@ -340,6 +367,14 @@ if Code.ensure_loaded?(:cowboy_req) do
       kind, reason ->
         Process.exit(relay, :kill)
         :erlang.raise(kind, reason, __STACKTRACE__)
+    end
+
+    # The connection died while the relay was opening: no response can reach
+    # the client, so none is recorded. The watcher already recorded
+    # `:caller_closed`.
+    defp caller_closed(req, exchange) do
+      Exchange.finish(exchange, :ended)
+      {:ok, req, :caller_closed}
     end
 
     defp upstream_failure(req, exchange, reason) do
@@ -405,7 +440,10 @@ if Code.ensure_loaded?(:cowboy_req) do
             Process.exit(relay, :kill)
 
           {:DOWN, ^holder, :process, _, _} ->
+            # Tell the handler before the relay's `:DOWN` reaches it, so it
+            # records no response for a connection that is gone.
             Exchange.interrupt(state.exchange, :caller_closed)
+            send(state.caller, {state.ref, :caller_closed})
             Process.exit(relay, :kill)
         end
       end)

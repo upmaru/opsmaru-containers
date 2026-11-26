@@ -44,10 +44,34 @@ if Code.ensure_loaded?(Plug.Conn) do
 
       try do
         serve(conn, options)
+      catch
+        kind, reason ->
+          # A crash that no path classified ends the exchange without
+          # finishing it. Response writes record `:caller_closed` themselves,
+          # and an earlier recorded reason still wins.
+          interrupt_current_exchange(:killed)
+          :erlang.raise(kind, reason, __STACKTRACE__)
       after
+        exchange = Process.get(@exchange_key)
         Process.delete(@exchange_key)
         Exchange.finish(exchange)
       end
+    end
+
+    defp interrupt_current_exchange(reason) do
+      exchange = current_exchange()
+
+      if exchange,
+        do: Process.put(@exchange_key, Exchange.interrupt(exchange, reason))
+    end
+
+    # A response write that raises or exits means the client went away.
+    defp write_response(fun) do
+      fun.()
+    catch
+      kind, reason ->
+        interrupt_current_exchange(:caller_closed)
+        :erlang.raise(kind, reason, __STACKTRACE__)
     end
 
     defp serve(conn, options) do
@@ -380,9 +404,8 @@ if Code.ensure_loaded?(Plug.Conn) do
         response.mode in [:complete, {:length, 0}] ->
           Exchange.commit(current_exchange(), response.status)
 
-          conn
-          |> response_headers(response, admission, true)
-          |> Plug.Conn.send_resp(response.status, "")
+          conn = response_headers(conn, response, admission, true)
+          write_response(fn -> Plug.Conn.send_resp(conn, response.status, "") end)
 
         version? and rewrite? ->
           respond_version(conn, response, admission, monitor)
@@ -390,9 +413,10 @@ if Code.ensure_loaded?(Plug.Conn) do
         true ->
           Exchange.commit(current_exchange(), response.status)
 
-          conn
-          |> response_headers(response, admission, false)
-          |> Plug.Conn.send_chunked(response.status)
+          conn = response_headers(conn, response, admission, false)
+
+          fn -> Plug.Conn.send_chunked(conn, response.status) end
+          |> write_response()
           |> stream_response(response, monitor)
       end
     end
@@ -410,7 +434,8 @@ if Code.ensure_loaded?(Plug.Conn) do
 
         Exchange.commit(current_exchange(), 200)
         Exchange.response_bytes(current_exchange(), byte_size(body))
-        conn |> response_headers(response, admission, false) |> Plug.Conn.send_resp(200, body)
+        conn = response_headers(conn, response, admission, false)
+        write_response(fn -> Plug.Conn.send_resp(conn, 200, body) end)
       else
         _ -> error(conn, 502, "Invalid Docker engine version response", :upstream_failed)
       end
@@ -432,7 +457,7 @@ if Code.ensure_loaded?(Plug.Conn) do
     defp stream_response(conn, response, monitor) do
       case read_engine(monitor, response.deadline, fn -> HTTP.next(response) end) do
         {:ok, bytes, response} ->
-          case Plug.Conn.chunk(conn, bytes) do
+          case chunk(conn, bytes) do
             {:ok, conn} ->
               Exchange.response_bytes(current_exchange(), byte_size(bytes))
               stream_response(conn, response, monitor)
@@ -455,14 +480,15 @@ if Code.ensure_loaded?(Plug.Conn) do
       end
     end
 
+    defp chunk(conn, bytes), do: write_response(fn -> Plug.Conn.chunk(conn, bytes) end)
+
     defp error(conn, status, message, reason) do
       body = Jason.encode!(%{message: message})
       Exchange.commit(current_exchange(), status, reason)
       Exchange.response_bytes(current_exchange(), byte_size(body))
 
-      conn
-      |> Plug.Conn.put_resp_content_type("application/json")
-      |> Plug.Conn.send_resp(status, body)
+      conn = Plug.Conn.put_resp_content_type(conn, "application/json")
+      write_response(fn -> Plug.Conn.send_resp(conn, status, body) end)
     end
 
     defp current_exchange, do: Process.get(@exchange_key)
