@@ -56,12 +56,18 @@ subsequent image inspection succeeded.
 ## Replacement exec helper on 2026-11-24
 
 The follow-up reused the same isolated Incus project and engine instance.
-It built a static Linux arm64 [guest bridge](../scripts/acceptance/exec_socket_bridge.go)
+It built a static Linux arm64 [guest bridge](../priv/exec_bridge/exec_socket_bridge.go)
 with Go 1.25.14 and uploaded it through the Incus file API. The
-[acceptance dialer](../scripts/acceptance/exec_socket_bridge.ex) passes
+acceptance dialer passes
 stdin through to the Unix socket and decodes bounded stdout frames. An
 explicit output EOF frame preserves the writable direction on the exec
 session. Docker clients receive the original bytes.
+
+The run used the helper and dialer while they were acceptance scripts under
+`scripts/acceptance`. The helper source has since moved, with only its header comment changed, to
+`priv/exec_bridge`, and the dialer is now the packaged
+`Opsmaru.Containers.Transport.ExecBridge`. The results below were recorded
+against the acceptance copies, not the packaged module.
 
 Both [half-close cases](../scripts/acceptance/exec_socket_bridge_half_close.ex)
 passed over authenticated Incus exec. When client input ended first, the
@@ -72,17 +78,18 @@ case, and both bridge processes exited with status zero. The pinned
 Docker CLI also received output after stdin EOF on an attached exec
 through the full relay.
 
-To reproduce, build the helper for the fixture architecture from a pinned
-Go toolchain, install it inside the disposable engine and pass the approved
-connected target to the acceptance module.
+To reproduce against the packaged module, build the helper for the fixture
+architecture with the recipe in [priv/exec_bridge](../priv/exec_bridge/README.md),
+install it inside the disposable engine and pass the approved connected
+target to the half-close script.
 
 ```sh
+cd priv/exec_bridge
 CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -buildvcs=false \
-  -o /tmp/exec-socket-bridge scripts/acceptance/exec_socket_bridge.go
+  -ldflags='-s -w -buildid=' -o /tmp/exec-socket-bridge .
 ```
 
 ```elixir
-Code.require_file("scripts/acceptance/exec_socket_bridge.ex")
 Code.require_file("scripts/acceptance/exec_socket_bridge_half_close.ex")
 
 Opsmaru.Containers.Acceptance.ExecSocketBridgeHalfClose.run(
