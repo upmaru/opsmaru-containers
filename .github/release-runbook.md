@@ -56,6 +56,17 @@ turn **Settings > Staged publishing** off on the package for fully unattended
 runs. If staging is on and the wait fails, approve and rerun the workflow (a
 rerun never re-uploads a staged release).
 
+## Concurrency
+
+The workflow runs on a single `release-main` concurrency group with
+`cancel-in-progress: false` and `queue: max`: one workflow run executes while
+GitHub retains up to 100 waiting runs; a new run at capacity is canceled, and
+accepting runs does not guarantee push order. This matters when an active
+release is in flight and two further pushes arrive — one of them may be an
+unrelated push; under the default `single` queue, an unrelated push would
+cancel and replace the pending legitimate release. `max` keeps both waiting
+runs without replacing the legitimate one.
+
 ## Ambiguous staging / recovery
 
 Do not re-run blindly while a release is half-published or staged. Confirm on

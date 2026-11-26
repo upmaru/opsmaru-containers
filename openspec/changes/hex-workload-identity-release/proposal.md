@@ -27,7 +27,11 @@ API keys, using a short-lived OIDC identity.
   creates the GitHub Release with notes from the changelog via
   `gh release create --verify-tag`; existing published tag/release is resumable;
   a published release with a missing tag or a conflicting tag is rejected. No
-  Hex credential. Release workflow is serialized.
+  Hex credential. The release workflow is serialized on the `release-main`
+  concurrency group (`cancel-in-progress: false`, `queue: max`): one
+  workflow run executes while GitHub retains up to 100 waiting runs; a new run
+  at capacity is canceled and accepting runs does not guarantee push order. A
+  legitimate pending release is never replaced by an unrelated push.
 - Add a concise release runbook (feature → develop; release/<version> from
   updated develop, version/date bump, PR to main with merge commit, then
   back-merge to develop; one-time bootstrap for the initial 0.1.0 package, then

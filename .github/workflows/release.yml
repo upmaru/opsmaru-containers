@@ -11,10 +11,14 @@ on:
 permissions:
   contents: read
 
-# One release at a time; runs are never cancelled mid-publish.
+# One release at a time; runs are never cancelled mid-publish. queue: max
+# keeps up to 100 pending runs in the release-main group without replacing
+# pending runs; unrelated pushes queue harmlessly ahead or behind the release
+# that is in flight.
 concurrency:
   group: release-main
   cancel-in-progress: false
+  queue: max
 
 env:
   HEX_PACKAGE: opsmaru_containers

@@ -40,9 +40,14 @@ The publish job SHALL use the already-configured release environment (main-only)
 
 ### Requirement: GitHub Release creation
 
-A separate job SHALL create tag `v<version>` at the exact merge SHA (after Hex is verified, via `gh release create --verify-tag`) with notes from the changelog section, and SHALL be resumable when the tag/release already exists correctly and published. A published release with a missing tag, or a conflicting pre-existing tag, SHALL be rejected with explicit operator recovery. It SHALL use no Hex credential. The release workflow SHALL be serialized (concurrency group, `cancel-in-progress: false`).
+A separate job SHALL create tag `v<version>` at the exact merge SHA (after Hex is verified, via `gh release create --verify-tag`) with notes from the changelog section, and SHALL be resumable when the tag/release already exists correctly and published. A published release with a missing tag, or a conflicting pre-existing tag, SHALL be rejected with explicit operator recovery. It SHALL use no Hex credential. The release workflow SHALL be serialized on the `release-main` concurrency group with `cancel-in-progress: false` and `queue: max`: one workflow run executes while GitHub retains up to 100 waiting runs; a new run at capacity is canceled; accepting runs does not guarantee push order. A legitimate pending release is never replaced by an unrelated push.
 
 #### Scenario: Existing correct tag
 
 - **WHEN** the tag and release already exist at the right SHA
 - **THEN** the job succeeds without recreating them
+
+#### Scenario: One active release plus two pending runs
+
+- **WHEN** a release is mid-publish and two further pushes arrive (one of them unrelated)
+- **THEN** both runs wait in the group without replacing the legitimate release; when the group is at capacity (100 waiting) additional pushes are canceled
