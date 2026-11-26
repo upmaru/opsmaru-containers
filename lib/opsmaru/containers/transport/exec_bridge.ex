@@ -99,7 +99,10 @@ defmodule Opsmaru.Containers.Transport.ExecBridge do
   # own timeouts, which may outlast the dial deadline. Run it in a holder
   # process and wait no longer than the deadline. The holder creates the
   # channels, so it owns them: it lives until `close/1` releases it or the
-  # dialing process exits. A setup that misses the deadline is killed, which
+  # dialing process exits. A separate unlinked watcher monitors the dialing
+  # process from outside the blocking exec call, so a dialing process that
+  # exits while the exec is still running kills the holder and with it any
+  # channels it opened. A setup that misses the deadline is killed, which
   # closes any channels it opened. An exec Incus already accepted is neither
   # deleted nor retried.
   defp exec(opts, instance, request, deadline) do
@@ -110,15 +113,17 @@ defmodule Opsmaru.Containers.Transport.ExecBridge do
     holder =
       spawn(fn ->
         Process.put(:"$callers", callers)
-        owner = Process.monitor(caller)
+        result = guard(fn -> opts.incus.exec(opts.client, instance, request) end)
+        Kernel.send(caller, {ref, result})
 
-        Kernel.send(
-          caller,
-          {ref, guard(fn -> opts.incus.exec(opts.client, instance, request) end)}
-        )
-
-        hold(ref, owner)
+        # A failed setup must not linger: only a successful session is held.
+        case result do
+          {:ok, _session} -> hold(ref)
+          _ -> :ok
+        end
       end)
+
+    spawn(fn -> watch_caller(caller, holder, callers) end)
 
     monitor = Process.monitor(holder)
 
@@ -152,11 +157,24 @@ defmodule Opsmaru.Containers.Transport.ExecBridge do
     end
   end
 
-  defp hold(ref, owner) do
+  # Kills the holder (and with it any channels it opened) as soon as the
+  # dialing process exits, whatever the holder is doing. Exits when the
+  # holder dies on its own, which is how close/1 releases it.
+  defp watch_caller(caller, holder, callers) do
+    Process.put(:"$callers", callers)
+    caller_ref = Process.monitor(caller)
+    holder_ref = Process.monitor(holder)
+
+    receive do
+      {:DOWN, ^caller_ref, :process, _, _} -> Process.exit(holder, :kill)
+      {:DOWN, ^holder_ref, :process, _, _} -> :ok
+    end
+  end
+
+  defp hold(ref) do
     receive do
       {^ref, :release} -> :ok
-      {:DOWN, ^owner, :process, _, _} -> :ok
-      _ -> hold(ref, owner)
+      _ -> hold(ref)
     end
   end
 

@@ -357,6 +357,38 @@ defmodule Opsmaru.Containers.Transport.ExecBridgeTest do
     assert reason in [:killed, :noproc]
   end
 
+  test "a dialing process that exits while exec is stalled stops the stalled exec" do
+    session = Fake.start(self())
+    test = self()
+
+    dialer =
+      spawn(fn ->
+        Fake.stall_exec(session)
+        ExecBridge.dial(target(), options(), deadline(5_000))
+        send(test, :dialed)
+      end)
+
+    assert_receive {:incus, {:exec_stalled, holder}}, 1_000
+
+    Process.exit(dialer, :kill)
+
+    monitor = Process.monitor(holder)
+    assert_receive {:DOWN, ^monitor, :process, ^holder, reason}, 500
+    assert reason in [:killed, :noproc]
+    refute_received :dialed
+  end
+
+  test "a failed exec leaves no holder behind" do
+    Fake.fail_exec(%Incus.Error{kind: :forbidden}, self())
+
+    assert {:error, {:exec, %Incus.Error{kind: :forbidden}}} =
+             ExecBridge.dial(target(), options(), deadline())
+
+    assert_received {:incus, {:exec_failed, holder}}
+    monitor = Process.monitor(holder)
+    assert_receive {:DOWN, ^monitor, :process, ^holder, _reason}, 500
+  end
+
   test "the setup process holds the session until close releases it" do
     {_session, handle} = connected("")
     {holder, _ref} = handle.holder

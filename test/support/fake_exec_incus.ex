@@ -26,6 +26,14 @@ defmodule Opsmaru.Containers.TestSupport.FakeExecIncus do
   def fail_exec(reason), do: Process.put({__MODULE__, :session}, {:error, reason})
 
   @doc """
+  Like fail_exec/1, but reports the calling process to `observer` as
+  `{:incus, {:exec_failed, pid}}` before returning the failure.
+  """
+  def fail_exec(reason, observer) when is_pid(observer) do
+    Process.put({__MODULE__, :session}, {:error, reason, observer})
+  end
+
+  @doc """
   Make the next exec in this process never return. The calling process is
   reported to `session`'s observer as `{:incus, {:exec_stalled, pid}}`.
   """
@@ -45,6 +53,10 @@ defmodule Opsmaru.Containers.TestSupport.FakeExecIncus do
   def exec(client, instance, request) do
     case selected() do
       {:error, reason} ->
+        {:error, reason}
+
+      {:error, reason, observer} ->
+        send(observer, {:incus, {:exec_failed, self()}})
         {:error, reason}
 
       {:stall, session} ->
