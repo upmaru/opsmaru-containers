@@ -361,12 +361,16 @@ if Code.ensure_loaded?(:cowboy_req) do
       holder = if is_pid(state.holder), do: Process.monitor(state.holder)
       state = Map.merge(state, %{caller_monitor: caller, holder_monitor: holder})
 
+      watcher = watch_open(self(), state)
+
       result =
         Raw.open(state.host, request,
           admission_deadline: state.admission_deadline,
           deadline: state.open_deadline,
           exchange: state.exchange
         )
+
+      send(watcher, :opened)
 
       case result do
         {:upgrade, response, backend, tail} ->
@@ -376,6 +380,35 @@ if Code.ensure_loaded?(:cowboy_req) do
         {:http, _, _, _} = http ->
           send(state.caller, {state.ref, http})
       end
+    end
+
+    # `Raw.open/3` runs synchronously here and cannot read the mailbox. A
+    # watcher ends the relay if the handler or the connection dies while it
+    # opens, so a lost client neither dials late nor holds a stalled
+    # handshake until the open deadline. Killing the relay closes the backend
+    # it owns. After `Raw.open/3` returns, the relay handles those monitors.
+    defp watch_open(relay, state) do
+      spawn(fn ->
+        relay_monitor = Process.monitor(relay)
+        caller = Process.monitor(state.caller)
+        holder = if is_pid(state.holder), do: Process.monitor(state.holder)
+
+        receive do
+          :opened ->
+            :ok
+
+          {:DOWN, ^relay_monitor, :process, _, _} ->
+            :ok
+
+          {:DOWN, ^caller, :process, _, _} ->
+            Exchange.interrupt(state.exchange, :killed)
+            Process.exit(relay, :kill)
+
+          {:DOWN, ^holder, :process, _, _} ->
+            Exchange.interrupt(state.exchange, :caller_closed)
+            Process.exit(relay, :kill)
+        end
+      end)
     end
 
     defp await_handoff(%{ref: ref, caller_monitor: caller} = state) do

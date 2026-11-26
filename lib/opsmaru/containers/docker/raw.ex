@@ -284,9 +284,7 @@ defmodule Opsmaru.Containers.Docker.Raw do
 
     case open(host, request, Keyword.merge(options, deadline: deadline)) do
       {:upgrade, response, backend, tail} ->
-        head = HTTP.raw_head(response)
-
-        case Stream.send(frontend, head, deadline) do
+        case send_head(frontend, HTTP.raw_head(response), deadline) do
           :ok ->
             result =
               run(frontend, backend, tail,
@@ -297,8 +295,10 @@ defmodule Opsmaru.Containers.Docker.Raw do
             {:relayed, result}
 
           _ ->
-            Stream.close(backend)
-            Stream.close(frontend)
+            # A failed, raising or exiting head write still closes both
+            # streams; the engine already accepted the upgrade.
+            close_stream(backend)
+            close_stream(frontend)
             exchange = Process.get(@exchange_key)
             Process.delete(@exchange_key)
             Exchange.interrupt(exchange, :caller_closed)
@@ -309,5 +309,17 @@ defmodule Opsmaru.Containers.Docker.Raw do
       {:http, status, headers, body} ->
         {:http, status, headers, body}
     end
+  end
+
+  defp send_head(frontend, head, deadline) do
+    Stream.send(frontend, head, deadline)
+  catch
+    _, _ -> {:error, :caller_closed}
+  end
+
+  defp close_stream(stream) do
+    Stream.close(stream)
+  catch
+    _, _ -> :ok
   end
 end

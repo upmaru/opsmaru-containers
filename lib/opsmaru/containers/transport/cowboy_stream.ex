@@ -9,8 +9,11 @@ if Code.ensure_loaded?(:cowboy_req) do
     # backpressure to the client. Active mode is required: OTP surfaces a
     # TLS peer's `close_notify` only as `{:ssl_closed, _}` (a passive recv
     # never reports it), and the transport's closed message is reported as
-    # `:eof`. Over TLS, OTP then ends the session, so later writes fail and
-    # the relay reports `:caller_closed` (design decision 4). Over TCP the
+    # `:eof`. Over TLS, OTP then ends the session: later writes are never
+    # delivered, and OTP may still accept some of them. The reader therefore
+    # flags a TLS peer close before it reports EOF, and `send/3` refuses to
+    # write after it, so the relay reports `:caller_closed` rather than
+    # counting bytes the client will never see (design decision 4). Over TCP the
     # socket is switched to `exit_on_close: false`, so a client half-close
     # keeps the write side open.
     #
@@ -20,12 +23,13 @@ if Code.ensure_loaded?(:cowboy_req) do
 
     @behaviour Opsmaru.Containers.Transport.Stream
 
-    defstruct [:reader, :monitor, :transport, :socket]
+    defstruct [:reader, :monitor, :transport, :socket, :peer_closed]
 
     @doc false
     def start(transport, socket, owner, deadline) do
       ref = make_ref()
-      reader = spawn(fn -> reader_init(transport, socket, owner, ref) end)
+      peer_closed = :atomics.new(1, [])
+      reader = spawn(fn -> reader_init(transport, socket, owner, ref, peer_closed) end)
 
       case transport.controlling_process(socket, reader) do
         :ok ->
@@ -35,7 +39,13 @@ if Code.ensure_loaded?(:cowboy_req) do
           monitor = Process.monitor(reader)
           send(reader, {:owned, ref})
 
-          %__MODULE__{reader: reader, monitor: monitor, transport: transport, socket: socket}
+          %__MODULE__{
+            reader: reader,
+            monitor: monitor,
+            transport: transport,
+            socket: socket,
+            peer_closed: peer_closed
+          }
 
         {:error, reason} ->
           Process.exit(reader, :kill)
@@ -69,14 +79,19 @@ if Code.ensure_loaded?(:cowboy_req) do
     end
 
     @impl Opsmaru.Containers.Transport.Stream
-    def send(%__MODULE__{transport: transport, socket: socket}, bytes, deadline) do
-      if deadline > System.monotonic_time(:millisecond) do
-        case transport.send(socket, bytes) do
-          :ok -> :ok
-          {:error, _} -> {:error, :closed}
-        end
-      else
-        {:error, :deadline}
+    def send(%__MODULE__{transport: transport, socket: socket} = stream, bytes, deadline) do
+      cond do
+        deadline <= System.monotonic_time(:millisecond) ->
+          {:error, :deadline}
+
+        :atomics.get(stream.peer_closed, 1) == 1 ->
+          {:error, :closed}
+
+        true ->
+          case transport.send(socket, bytes) do
+            :ok -> :ok
+            {:error, _} -> {:error, :closed}
+          end
       end
     end
 
@@ -120,7 +135,7 @@ if Code.ensure_loaded?(:cowboy_req) do
 
     # --- Reader -----------------------------------------------------------------
 
-    defp reader_init(transport, socket, owner, ref) do
+    defp reader_init(transport, socket, owner, ref, peer_closed) do
       owner_monitor = Process.monitor(owner)
 
       receive do
@@ -132,6 +147,7 @@ if Code.ensure_loaded?(:cowboy_req) do
         transport: transport,
         socket: socket,
         owner_monitor: owner_monitor,
+        peer_closed: peer_closed,
         buffer: "",
         closed: false,
         error: nil,
@@ -152,7 +168,13 @@ if Code.ensure_loaded?(:cowboy_req) do
         {tag, _socket, data} when tag in [:ssl, :tcp] and is_binary(data) ->
           loop(deliver(%{state | armed: false, buffer: state.buffer <> data}))
 
-        {tag, _socket} when tag in [:ssl_closed, :tcp_closed] ->
+        {:ssl_closed, _socket} ->
+          # Flagged before EOF is reported, so no write ordered after it
+          # reaches OTP.
+          :atomics.put(state.peer_closed, 1, 1)
+          loop(deliver(%{state | armed: false, closed: true}))
+
+        {:tcp_closed, _socket} ->
           loop(deliver(%{state | armed: false, closed: true}))
 
         {tag, _socket, reason} when tag in [:ssl_error, :tcp_error] ->

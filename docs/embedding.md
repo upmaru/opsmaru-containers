@@ -126,9 +126,11 @@ accepted, so it is never retried.
 On TLS the relay owns the socket through `Transport.CowboyStream`. Engine
 EOF is sent to the client as TLS `close_notify`, and the client can keep
 writing afterwards. When the client sends `close_notify` first, the relay
-forwards EOF to the engine at once. OTP then fails later server writes on
-that connection, so output the engine sends after client EOF is lost, and
-the exchange ends with `reason: :caller_closed`. Whether the pinned Docker
+forwards EOF to the engine at once. OTP does not deliver later server
+writes on that connection, though it can still accept some of them. The
+relay therefore writes nothing to a TLS connection after the client's
+`close_notify`. Output the engine sends after client EOF is lost, and the
+exchange ends with `reason: :caller_closed`, never as a silent success. Whether the pinned Docker
 CLI half-closes its hijacked TLS connection with `close_notify` or with a
 TCP write shutdown beneath TLS is still being measured (task 2.5 of
 `add-cowboy-gateway-embedding`). Until then, treat `docker exec -i` with

@@ -78,8 +78,8 @@ defmodule Opsmaru.Containers.Docker.RawTunnel do
               if not upload?, do: count.(byte_size(prefix), :tail)
               copy(source, destination, deadline, {recv_reason, send_reason}, {count, upload?})
 
-            {:error, _} ->
-              {:error, send_reason}
+            error ->
+              failure(error, send_reason, deadline)
           end
         end
       rescue
@@ -98,8 +98,8 @@ defmodule Opsmaru.Containers.Docker.RawTunnel do
       :eof ->
         end_write(destination, deadline, reasons)
 
-      _ ->
-        {:error, recv_reason}
+      error ->
+        failure(error, recv_reason, deadline)
     end
   end
 
@@ -114,16 +114,26 @@ defmodule Opsmaru.Containers.Docker.RawTunnel do
         if not upload?, do: count.(byte_size(data), :data)
         copy(source, destination, deadline, reasons, counter)
 
-      {:error, _} ->
-        {:error, send_reason}
+      error ->
+        failure(error, send_reason, deadline)
     end
   end
 
   defp end_write(destination, deadline, {_, send_reason}) do
     case Stream.shutdown_write(destination, deadline) do
       :ok -> :ok
-      {:error, _} -> {:error, send_reason}
+      error -> failure(error, send_reason, deadline)
     end
+  end
+
+  # An adapter's own `:deadline`, or a failure once the deadline has passed,
+  # is the deadline, not a broken peer.
+  defp failure({:error, :deadline}, _side, _deadline), do: {:error, :deadline}
+
+  defp failure(_error, side, deadline) do
+    if System.monotonic_time(:millisecond) >= deadline,
+      do: {:error, :deadline},
+      else: {:error, side}
   end
 
   defp wait(tasks, _) when map_size(tasks) == 0, do: :ok

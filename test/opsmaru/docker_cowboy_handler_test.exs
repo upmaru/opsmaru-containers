@@ -21,6 +21,22 @@ defmodule Opsmaru.Containers.Docker.CowboyHandlerTest do
 
   @exec_body ~s({"Detach":false,"Tty":false})
 
+  defmodule SlowHost do
+    @moduledoc false
+    # Reports its callback process, then holds admission for a second.
+    @behaviour Opsmaru.Containers.Host
+
+    @impl Opsmaru.Containers.Host
+    def context(%{host_peer: {context, observer}}) do
+      send(observer, {:opening, self()})
+      Process.sleep(1_000)
+      {:ok, context}
+    end
+
+    @impl Opsmaru.Containers.Host
+    def authorize(_context, _request), do: :allow
+  end
+
   setup do
     engine = EngineFixture.start()
     TelemetryCapture.attach()
@@ -426,11 +442,14 @@ defmodule Opsmaru.Containers.Docker.CowboyHandlerTest do
       backend = EngineFixture.accept(engine)
       {_head, _body, _} = EngineFixture.read_request(backend)
 
-      {:monitored_by, [handler]} = Process.info(relay, :monitored_by)
+      # The handler spawned the relay.
+      {:parent, handler} = Process.info(relay, :parent)
+
       Process.exit(handler, :kill)
 
-      # The engine accepts only after the handler is gone.
-      :ok = :gen_tcp.send(backend, EngineFixture.upgraded())
+      # The relay ends with the handler, so the engine's late 101 meets a
+      # closed backend.
+      _ = :gen_tcp.send(backend, EngineFixture.upgraded())
       assert {"", :eof} = EngineFixture.read_to_eof(backend)
 
       case CowboyFixture.recv_head(:ssl, socket) do
@@ -442,6 +461,43 @@ defmodule Opsmaru.Containers.Docker.CowboyHandlerTest do
       assert {_, %{reason: :killed, outcome: :uncertain}} = exchange.stop
       refute_receive {:dialed, _}, 200
       :ssl.close(socket)
+    end
+
+    test "a client lost during admission ends the relay before it dials", %{engine: engine} do
+      listener = tls_listener(engine, [], host: SlowHost)
+      socket = CowboyFixture.connect_tls(listener)
+      :ok = :ssl.send(socket, exec_start())
+
+      # Host callbacks run in their own process, spawned by the relay.
+      assert_receive {:opening, callback}, 2_000
+      {:parent, relay} = Process.info(callback, :parent)
+      monitor = Process.monitor(relay)
+      :ssl.close(socket)
+
+      assert_receive {:DOWN, ^monitor, :process, ^relay, :killed}, 500
+      exchange = assert_exchange()
+      assert {_, %{status: nil, outcome: :not_sent, reason: reason}} = exchange.stop
+      assert reason in [:caller_closed, :killed]
+      refute_receive {:dialed, _}, 1_200
+    end
+
+    test "a client lost during a stalled handshake closes the backend at once",
+         %{engine: engine} do
+      listener = tls_listener(engine)
+      socket = CowboyFixture.connect_tls(listener)
+      :ok = :ssl.send(socket, exec_start())
+
+      assert_receive {:dialed, _relay}, 2_000
+      backend = EngineFixture.accept(engine)
+      {_head, _body, _} = EngineFixture.read_request(backend)
+      :ssl.close(socket)
+
+      # Well before the 30 s dial timeout that bounds the handshake.
+      assert {"", :eof} = EngineFixture.read_to_eof(backend, "", 1_000)
+      exchange = assert_exchange()
+      assert {_, %{status: nil, outcome: :uncertain, reason: reason}} = exchange.stop
+      assert reason in [:caller_closed, :killed]
+      refute_receive {:dialed, _}, 200
     end
 
     test "a takeover that misses the handoff timeout closes the backend", %{engine: engine} do

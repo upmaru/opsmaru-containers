@@ -99,6 +99,43 @@ defmodule Opsmaru.Containers.Docker.RawOpenRunTest do
     def close(_handle), do: :ok
   end
 
+  defmodule DeadlineFrontend do
+    @moduledoc false
+    # A frontend adapter that reports its own deadline long before the
+    # exchange deadline passes.
+    @behaviour Stream
+
+    @impl Stream
+    def recv(_handle, _limit, _deadline), do: {:error, :deadline}
+
+    @impl Stream
+    def send(_handle, _bytes, _deadline), do: :ok
+
+    @impl Stream
+    def shutdown_write(_handle, _deadline), do: :ok
+
+    @impl Stream
+    def close(_handle), do: :ok
+  end
+
+  defmodule RaisingFrontend do
+    @moduledoc false
+    # A host frontend whose head write raises; close/1 reports to the test.
+    @behaviour Stream
+
+    @impl Stream
+    def recv(_test, _limit, _deadline), do: :eof
+
+    @impl Stream
+    def send(_test, _bytes, _deadline), do: raise("frontend write failed")
+
+    @impl Stream
+    def shutdown_write(_test, _deadline), do: :ok
+
+    @impl Stream
+    def close(test), do: send(test, :frontend_closed)
+  end
+
   @socket_options [:binary, active: false, exit_on_close: false, send_timeout: 2_000]
 
   defp now, do: System.monotonic_time(:millisecond)
@@ -504,5 +541,55 @@ defmodule Opsmaru.Containers.Docker.RawOpenRunTest do
 
     assert {:error, :stream_failed} = Task.await(task, 5_000)
     assert {:error, :closed} = :gen_tcp.recv(listener, 0, 2_000)
+  end
+
+  test "run/4 reports an adapter's own deadline as the deadline" do
+    {daemon, dialer} = unix_pair()
+    frontend = %Stream{adapter: DeadlineFrontend, handle: nil}
+    backend = %Stream{adapter: SocketAdapter, handle: dialer}
+    started = now()
+
+    task =
+      Task.async(fn ->
+        receive do
+          :start -> Raw.run(frontend, backend, "", deadline: now() + 10_000, request_tail: "")
+        end
+      end)
+
+    :ok = :gen_tcp.controlling_process(dialer, task.pid)
+    send(task.pid, :start)
+
+    assert Task.await(task, 5_000) == {:error, :deadline}
+    assert now() - started < 5_000
+    assert {:error, :closed} = :gen_tcp.recv(daemon, 0, 2_000)
+  end
+
+  test "relay/4 closes both streams when the head write raises" do
+    {daemon, dialer} = unix_pair()
+    context = host_context(dialer)
+    request = detached_exec_request(context)
+    test = self()
+
+    task =
+      Task.async(fn ->
+        Raw.relay(RawHost, request, %Stream{adapter: RaisingFrontend, handle: test},
+          admission_deadline: deadline(),
+          deadline: deadline(),
+          request_tail: ""
+        )
+      end)
+
+    :ok = :gen_tcp.controlling_process(dialer, task.pid)
+    {_head, _body} = read_request(daemon, "", byte_size(request.body))
+
+    :ok =
+      :gen_tcp.send(
+        daemon,
+        "HTTP/1.1 101 UPGRADED\r\nConnection: Upgrade\r\nUpgrade: tcp\r\n\r\n"
+      )
+
+    assert Task.await(task, 5_000) == {:relayed, {:error, :stream_failed}}
+    assert_receive :frontend_closed
+    assert {:error, :closed} = :gen_tcp.recv(daemon, 0, 2_000)
   end
 end
