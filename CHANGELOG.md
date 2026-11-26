@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.2.0 — unreleased
+## 0.2.0 — 2026-11-26
 
 - Split `Raw.relay/4` into `Raw.open/3` and `Raw.run/4` for listeners that
   write the frontend handshake themselves. Both must run in the same process,
