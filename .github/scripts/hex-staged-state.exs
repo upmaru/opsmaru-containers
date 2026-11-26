@@ -18,24 +18,32 @@
 # (exit non-zero) without printing outputs. Credentials are never printed.
 
 defmodule HexStagedState do
+  # Hex is loaded at run time by Mix.Local.append_archives/0, after this file
+  # compiles.
+  @compile {:no_warn_undefined, [Hex, Hex.WorkloadIdentity, Hex.API.Release]}
+
   @package "opsmaru_containers"
   @suffixes ["staged", "docs/staged"]
   @dashboard "https://hex.pm/dashboard/staged-releases"
 
   def run do
-    case System.argv() do
-      [version, suffix] ->
-        with {:ok, _} <- Version.parse(version),
-             true <- suffix in @suffixes do
-          read(version, suffix)
-        else
-          _ -> fail("invalid arguments: expected VERSION (semver) SUFFIX")
-        end
-
-      _ ->
-        fail("usage: hex-staged-state.exs VERSION SUFFIX")
+    case parse_args(System.argv()) do
+      {:ok, {version, suffix}} -> read(version, suffix)
+      {:error, message} -> fail(message)
     end
   end
+
+  @doc false
+  def parse_args([version, suffix]) do
+    with {:ok, _} <- Version.parse(version),
+         true <- suffix in @suffixes do
+      {:ok, {version, suffix}}
+    else
+      _ -> {:error, "invalid arguments: expected VERSION (semver) SUFFIX"}
+    end
+  end
+
+  def parse_args(_), do: {:error, "usage: hex-staged-state.exs VERSION SUFFIX"}
 
   defp read(version, suffix) do
     Mix.Local.append_archives()
@@ -61,24 +69,24 @@ defmodule HexStagedState do
     url = "https://hex.pm/api/packages/#{@package}/releases/#{version}/#{suffix}"
 
     try do
-      case Hex.API.Release.get_staged(url, auth) do
-        {:ok, {200, _headers, %{"status" => status} = body}}
-        when status in ["staged", "approved", "rejected", "expired"] ->
-          output(status, Map.get(body, "html_url"), Map.get(body, "checksum"))
-
-        {:ok, {200, _headers, _body}} ->
-          fail("staged record has no readable status")
-
-        {:ok, {404, _headers, _body}} ->
-          output("missing", nil, nil)
-
-        _ ->
-          fail("unexpected Hex answer")
+      case interpret(Hex.API.Release.get_staged(url, auth)) do
+        {:ok, lines} -> Enum.each(lines, &IO.puts/1)
+        {:error, message} -> fail(message)
       end
     rescue
       _ -> fail("staged read failed")
     end
   end
+
+  @doc false
+  def interpret({:ok, {200, _headers, %{"status" => status} = body}})
+      when status in ["staged", "approved", "rejected", "expired"] do
+    {:ok, output(status, Map.get(body, "html_url"), Map.get(body, "checksum"))}
+  end
+
+  def interpret({:ok, {200, _headers, _body}}), do: {:error, "staged record has no readable status"}
+  def interpret({:ok, {404, _headers, _body}}), do: {:ok, output("missing", nil, nil)}
+  def interpret(_), do: {:error, "unexpected Hex answer"}
 
   defp output(status, html_url, checksum) do
     {status, html_url, checksum} =
@@ -88,9 +96,11 @@ defmodule HexStagedState do
         {status, html_url, checksum}
       end
 
-    IO.puts("status=#{status}")
-    IO.puts("html_url=#{validate_url(html_url) || @dashboard}")
-    IO.puts("checksum=#{validate_checksum(checksum) || ""}")
+    [
+      "status=#{status}",
+      "html_url=#{validate_url(html_url) || @dashboard}",
+      "checksum=#{validate_checksum(checksum) || ""}"
+    ]
   end
 
   defp validate_url(url) when is_binary(url) do
@@ -123,4 +133,10 @@ defmodule HexStagedState do
   end
 end
 
-HexStagedState.run()
+# The regression tests set HEX_STAGED_STATE_LOAD_ONLY=1 to load the module
+# without running it. With it set, the script reads no credentials and prints
+# nothing, which the upload-state helper treats as an empty answer and fails
+# closed.
+if System.get_env("HEX_STAGED_STATE_LOAD_ONLY") != "1" do
+  HexStagedState.run()
+end
