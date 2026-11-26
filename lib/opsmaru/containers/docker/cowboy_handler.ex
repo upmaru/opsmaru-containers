@@ -80,6 +80,7 @@ if Code.ensure_loaded?(:cowboy_req) do
     @max_timeout 86_400_000
     @takeovers %{"docker_stream" => "tcp", "h2c_upgrade" => "h2c", "websocket" => "websocket"}
     @exec_start "/exec/{name:.*}/start"
+    @repeated_headers ["x-docker-expose-session-grpc-method"]
 
     @impl true
     def init(req, opts) do
@@ -295,12 +296,31 @@ if Code.ensure_loaded?(:cowboy_req) do
       end
     end
 
+    # Cowboy joins a repeated request header into one value separated by
+    # ", ". BuildKit's session request repeats
+    # X-Docker-Expose-Session-Grpc-Method once per exposed gRPC method, and
+    # dockerd reads each value as one method name, so the joined value hides
+    # every method and the build fails with "no local sources enabled".
+    # Restore the separate values. gRPC method paths never contain a comma.
+    defp request_headers(req) do
+      req
+      |> :cowboy_req.headers()
+      |> Map.to_list()
+      |> Enum.flat_map(&split_repeated/1)
+    end
+
+    defp split_repeated({name, value}) when name in @repeated_headers do
+      for part <- String.split(value, ","), part = String.trim(part), part != "", do: {name, part}
+    end
+
+    defp split_repeated(header), do: [header]
+
     defp open(req, opts, host, body, exchange, limits, started) do
       request = %{
         method: req.method,
         path: req.path,
         query: :cowboy_req.qs(req),
-        headers: Map.to_list(:cowboy_req.headers(req)),
+        headers: request_headers(req),
         body: body,
         peer: elem(:cowboy_req.peer(req), 0),
         host_peer: Map.get(opts, :host_peer)

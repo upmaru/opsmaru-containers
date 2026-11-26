@@ -560,6 +560,40 @@ defmodule Opsmaru.Containers.Docker.CowboyHandlerTest do
     end
   end
 
+  describe "repeated request headers" do
+    test "BuildKit session methods reach the engine as separate headers", %{engine: engine} do
+      listener = tls_listener(engine)
+      socket = CowboyFixture.connect_tls(listener)
+
+      methods = [
+        "/moby.filesync.v1.FileSync/DiffCopy",
+        "/moby.filesync.v1.FileSync/TarStream",
+        "/grpc.health.v1.Health/Check"
+      ]
+
+      headers =
+        [{"Connection", "Upgrade"}, {"Upgrade", "h2c"}, {"X-Docker-Expose-Session-Uuid", "s1"}] ++
+          Enum.map(methods, &{"X-Docker-Expose-Session-Grpc-Method", &1})
+
+      :ok = :ssl.send(socket, request("POST", "/session", headers))
+      assert_receive {:dialed, _relay}, 2_000
+
+      {backend, head, _body, _rest} = accept_upgrade(engine, "")
+
+      forwarded =
+        for line <- String.split(head, "\r\n"),
+            [name, value] <- [String.split(line, ": ", parts: 2)],
+            String.downcase(name) == "x-docker-expose-session-grpc-method",
+            do: value
+
+      assert forwarded == methods
+      assert head =~ "\r\nx-docker-expose-session-uuid: s1"
+
+      :ssl.close(socket)
+      :gen_tcp.close(backend)
+    end
+  end
+
   describe "2.4 half-close" do
     @tag :go
     test "TLS: engine EOF first sends close_notify and the client's later bytes still arrive",
