@@ -45,6 +45,15 @@ defmodule Opsmaru.Release.HexUploadStateTest do
   printf '%s\\n' "$answer"
   """
 
+  setup_all do
+    # The helper hides a missing jq behind "unexpected JSON", so say so here.
+    unless System.find_executable("jq") do
+      flunk("jq is required by hex-upload-state.sh; run `mise install`")
+    end
+
+    :ok
+  end
+
   setup %{tmp_dir: tmp_dir} do
     bin = Path.join(tmp_dir, "bin")
     File.mkdir_p!(bin)
