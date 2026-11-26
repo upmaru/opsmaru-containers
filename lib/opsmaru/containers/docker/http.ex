@@ -58,19 +58,10 @@ defmodule Opsmaru.Containers.Docker.HTTP do
     end
   end
 
-  def raw_head(%{mode: {:raw, protocol}, status: status, headers: headers}, maximum) do
+  def raw_head(%{status: status, headers: headers}) do
     status_line = if status == 101, do: "HTTP/1.1 101 UPGRADED\r\n", else: "HTTP/1.1 200 OK\r\n"
-    upgraded = if protocol, do: connection_headers(protocol), else: []
 
-    headers =
-      headers
-      |> end_to_end()
-      |> Enum.map(fn
-        {"api-version", _} -> {"api-version", maximum}
-        header -> header
-      end)
-
-    [status_line, encode_headers(headers ++ upgraded), "\r\n"]
+    [status_line, encode_headers(headers), "\r\n"]
   end
 
   defp connection_headers(nil), do: [{"connection", "close"}]

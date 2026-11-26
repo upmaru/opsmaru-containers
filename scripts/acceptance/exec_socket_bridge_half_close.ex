@@ -1,7 +1,7 @@
 defmodule Opsmaru.Containers.Acceptance.ExecSocketBridgeHalfClose do
   @moduledoc false
 
-  alias Opsmaru.Containers.Acceptance.ExecSocketBridge
+  alias Opsmaru.Containers.Transport.ExecBridge
   alias Opsmaru.Containers.Transport.Stream
   alias Opsmaru.Incus.Session
 
@@ -50,7 +50,7 @@ defmodule Opsmaru.Containers.Acceptance.ExecSocketBridgeHalfClose do
       peer = start_peer(target, path, first)
       deadline = now() + 10_000
       options = %{helper: helper, socket: path, observer: self()}
-      {:ok, stream} = ExecSocketBridge.dial(target, options, deadline)
+      {:ok, stream} = ExecBridge.dial(target, options, deadline)
 
       try do
         verify_direction(stream, first, deadline)
