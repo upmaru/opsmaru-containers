@@ -199,10 +199,18 @@ defmodule Opsmaru.Containers.Transport.ExecBridge do
       observer: opts.observer,
       limits: opts.limits,
       counters: :atomics.new(2, signed: false),
-      keepalive: nil
+      keepalive: nil,
+      stderr: nil
     }
 
-    spawn_link(fn -> drain_stderr(handle, deadline) end)
+    # Stderr is drained for the life of the session, not until the dial
+    # deadline: a host may dial with a deadline far shorter than the stream
+    # (`Docker.CowboyHandler` passes its open deadline). The drain ends when
+    # channel 2 ends or fails, when `close/1` stops it, or within a second of
+    # the dialing process's exit. It is not linked, so stopping it from any
+    # process never takes the stream's owner down with it.
+    owner = self()
+    handle = %{handle | stderr: spawn(fn -> drain_stderr(handle, owner) end)}
 
     case take(handle, byte_size(@header), deadline) do
       {:ok, @header} ->
@@ -239,11 +247,22 @@ defmodule Opsmaru.Containers.Transport.ExecBridge do
     end
   end
 
-  defp drain_stderr(handle, deadline) do
-    case guard(fn -> output(handle, "2", deadline) end) do
-      {:ok, data} ->
+  defp drain_stderr(handle, owner) do
+    result =
+      if Process.alive?(owner),
+        do: guard(fn -> handle.incus.output(handle.session, "2", 1_000) end),
+        else: :owner_down
+
+    case result do
+      {:ok, {:binary, ""}} ->
+        drain_stderr(handle, owner)
+
+      {:ok, {:binary, data}} ->
         notify(handle, {:helper_stderr, data})
-        drain_stderr(handle, deadline)
+        drain_stderr(handle, owner)
+
+      {:error, %Error{kind: :deadline}} ->
+        drain_stderr(handle, owner)
 
       _ ->
         :ok
@@ -381,6 +400,7 @@ defmodule Opsmaru.Containers.Transport.ExecBridge do
   @impl Stream
   def close(handle) do
     if handle.keepalive, do: Process.exit(handle.keepalive, :kill)
+    stop_stderr(handle.stderr)
     %{incus: incus, session: session} = handle
 
     # Signal only a helper that is still running, wait a bounded time, then
@@ -394,6 +414,10 @@ defmodule Opsmaru.Containers.Transport.ExecBridge do
     guard(fn -> Agent.stop(handle.buffer) end)
     :ok
   end
+
+  defp stop_stderr(pid) when is_pid(pid), do: Process.exit(pid, :kill)
+
+  defp stop_stderr(_), do: :ok
 
   defp guard(fun) do
     fun.()

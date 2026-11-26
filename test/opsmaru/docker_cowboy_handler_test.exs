@@ -190,6 +190,34 @@ defmodule Opsmaru.Containers.Docker.CowboyHandlerTest do
       assert_receive {:fallback, "GET", "/v1.57/info", "", []}
     end
 
+    test "keyword-list handler options serve the fallback and the raw path", %{engine: engine} do
+      handler_opts =
+        AllowHost
+        |> CowboyFixture.handler_opts(EngineFixture.context(engine), self())
+        |> Map.to_list()
+
+      listener = CowboyFixture.start_tls(handler_opts)
+
+      assert {200, "fallback GET /v1.57/containers/json body= upgrade="} =
+               tls_request(listener, request("GET", "/v1.57/containers/json"))
+
+      socket = CowboyFixture.connect_tls(listener)
+      :ok = :ssl.send(socket, exec_start("", "/v1.57/containers/missing/attach"))
+      backend = EngineFixture.accept(engine)
+      {_head, _body, _} = EngineFixture.read_request(backend)
+      message = ~s({"message":"No such container: missing"})
+
+      :ok =
+        :gen_tcp.send(
+          backend,
+          "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\n" <>
+            "Api-Version: 1.58\r\nContent-Length: #{byte_size(message)}\r\n\r\n" <> message
+        )
+
+      assert {404, _head, ^message} = CowboyFixture.recv_response(:ssl, socket)
+      :ssl.close(socket)
+    end
+
     test "raw-stream routes without Upgrade get a Docker-shaped 400 with no admission",
          %{engine: engine} do
       listener = tls_listener(engine)
@@ -496,6 +524,8 @@ defmodule Opsmaru.Containers.Docker.CowboyHandlerTest do
       assert {"", :eof} = EngineFixture.read_to_eof(backend, "", 1_000)
       exchange = assert_exchange()
       assert {_, %{status: nil, outcome: :uncertain, reason: reason}} = exchange.stop
+      # No response can reach a closed connection, so none is recorded.
+      assert exchange.request == nil
       assert reason in [:caller_closed, :killed]
       refute_receive {:dialed, _}, 200
     end

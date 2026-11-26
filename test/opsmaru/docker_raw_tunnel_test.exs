@@ -45,6 +45,28 @@ defmodule Opsmaru.Containers.Docker.RawTunnelTest do
     def close(socket), do: :gen_tcp.close(socket)
   end
 
+  defmodule ScriptedSide do
+    @moduledoc false
+    # One in-memory side of a tunnel. The handle names its behaviour:
+    # `:talks` reads data forever, `:silent` reads EOF at once, and
+    # `:raises` raises on every write.
+    @behaviour Stream
+
+    @impl Stream
+    def recv(:talks, _limit, _deadline), do: {:ok, "bytes"}
+    def recv(_, _limit, _deadline), do: :eof
+
+    @impl Stream
+    def send(:raises, _bytes, _deadline), do: raise("write failed")
+    def send(_, _bytes, _deadline), do: :ok
+
+    @impl Stream
+    def shutdown_write(_, _deadline), do: :ok
+
+    @impl Stream
+    def close(_), do: :ok
+  end
+
   @socket_options [
     :binary,
     active: false,
@@ -89,6 +111,17 @@ defmodule Opsmaru.Containers.Docker.RawTunnelTest do
   end
 
   @tag :unix_socket
+  test "a write that raises blames the side written to, not the side read from" do
+    side = fn handle -> %Stream{adapter: ScriptedSide, handle: handle} end
+    options = [deadline: deadline(), request_tail: "", response_tail: ""]
+
+    # The engine talks and the frontend write raises: the caller failed.
+    assert RawTunnel.run(side.(:raises), side.(:talks), options) == {:error, :caller_closed}
+
+    # The client talks and the backend write raises: the backend failed.
+    assert RawTunnel.run(side.(:talks), side.(:raises), options) == {:error, :backend_closed}
+  end
+
   test "idle handoff is bounded and closes both sockets" do
     {cli, listener} = unix_pair()
     {daemon, dialer} = unix_pair()

@@ -342,6 +342,22 @@ defmodule Opsmaru.Containers.Transport.ExecBridgeTest do
     assert ExecBridge.recv(handle, 1_024, deadline()) == {:ok, "out"}
   end
 
+  test "helper stderr is still drained after the dial deadline has passed" do
+    session = Fake.start(self(), stderr: [])
+    Fake.push(session, "1", {:binary, "OCB1"})
+    Fake.use_session(session)
+
+    {:ok, %Stream{adapter: ExecBridge, handle: handle}} =
+      ExecBridge.dial(target(), options(observer: self()), deadline(100))
+
+    Process.sleep(250)
+    Fake.push(session, "2", {:binary, "late warning"})
+    assert_receive {:helper_stderr, "late warning"}, 1_500
+
+    assert ExecBridge.close(handle) == :ok
+    refute Process.alive?(handle.stderr)
+  end
+
   defp collect(acc \\ []) do
     receive do
       {:incus, event} -> collect([event | acc])

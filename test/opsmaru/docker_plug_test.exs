@@ -130,6 +130,32 @@ defmodule Opsmaru.Containers.Docker.PlugTest do
     end
   end
 
+  defmodule CloseRaisingEngine do
+    @moduledoc false
+    # The scripted engine, except that closing the backend raises: a crash no
+    # path of the Plug classifies.
+    @behaviour Transport
+    @behaviour Stream
+
+    @impl Transport
+    def dial(target, options, deadline) do
+      {:ok, stream} = ScriptedEngine.dial(target, options, deadline)
+      {:ok, %{stream | adapter: __MODULE__}}
+    end
+
+    @impl Stream
+    defdelegate recv(connection, limit, deadline), to: ScriptedEngine
+
+    @impl Stream
+    defdelegate send(connection, iodata, deadline), to: ScriptedEngine
+
+    @impl Stream
+    defdelegate shutdown_write(connection, deadline), to: ScriptedEngine
+
+    @impl Stream
+    def close(_connection), do: raise("close failed")
+  end
+
   defmodule FailingStreamAdapter do
     @moduledoc false
     # A Plug.Conn.Adapter that accepts the chunked send, then fails the write
@@ -419,6 +445,17 @@ defmodule Opsmaru.Containers.Docker.PlugTest do
     assert %{stop: {_, stop}} = assert_exchange()
     assert stop.outcome == :sent
     assert stop.reason == :caller_closed
+  end
+
+  test "a crash outside a response write reports :killed, not :caller_closed" do
+    TelemetryCapture.attach()
+    response = fixed_response(200, "")
+    context = %{engine(response) | dialer: {CloseRaisingEngine, {self(), response}}}
+
+    assert_raise RuntimeError, "close failed", fn -> call("GET", "/_ping", context) end
+
+    assert %{stop: {_, stop}} = assert_exchange()
+    assert stop.reason == :killed
   end
 
   test "an ordinary successful request still reports outcome :ok" do
