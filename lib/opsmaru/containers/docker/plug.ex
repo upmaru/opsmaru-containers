@@ -44,10 +44,22 @@ if Code.ensure_loaded?(Plug.Conn) do
 
       try do
         serve(conn, options)
+      catch
+        kind, reason ->
+          interrupt_current_exchange()
+          :erlang.raise(kind, reason, __STACKTRACE__)
       after
+        exchange = Process.get(@exchange_key)
         Process.delete(@exchange_key)
         Exchange.finish(exchange)
       end
+    end
+
+    defp interrupt_current_exchange do
+      exchange = current_exchange()
+
+      if exchange,
+        do: Process.put(@exchange_key, Exchange.interrupt(exchange, :caller_closed))
     end
 
     defp serve(conn, options) do

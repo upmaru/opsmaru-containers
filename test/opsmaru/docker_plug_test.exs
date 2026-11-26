@@ -1,5 +1,10 @@
 defmodule Opsmaru.Containers.Docker.PlugTest do
-  use ExUnit.Case, async: true
+  # Telemetry events are VM-global, so this suite runs serially.
+  use ExUnit.Case, async: false
+
+  import Opsmaru.Containers.TestSupport.TelemetryCapture, only: [assert_exchange: 0]
+
+  alias Opsmaru.Containers.TestSupport.TelemetryCapture
 
   alias Elixir.Plug.{Conn, Test}
   alias Opsmaru.Containers.{Context, Host, Transport}
@@ -123,6 +128,15 @@ defmodule Opsmaru.Containers.Docker.PlugTest do
       send(observer, {:wire, IO.iodata_to_binary(Enum.reverse(sent))})
       Agent.stop(connection)
     end
+  end
+
+  defmodule FailingStreamAdapter do
+    @moduledoc false
+    # A Plug.Conn.Adapter that accepts the chunked send, then fails the write
+    # mid-stream, simulating a client that disconnects while the engine's
+    # successful response is being sent.
+    def send_chunked(payload, _status, _headers), do: {:ok, nil, payload}
+    def chunk(_payload, _body), do: raise("client write failed")
   end
 
   test "preserves the encoded request target, repeated headers and chunked engine body" do
@@ -389,6 +403,36 @@ defmodule Opsmaru.Containers.Docker.PlugTest do
     end
   end
 
+  test "a failed response write reports the interruption on the stop event" do
+    TelemetryCapture.attach()
+
+    response = [
+      "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n",
+      "2\r\nab\r\n",
+      "0\r\n\r\n"
+    ]
+
+    assert_raise RuntimeError, "client write failed", fn ->
+      call_with_failing_adapter("GET", "/events", engine(response))
+    end
+
+    assert %{stop: {_, stop}} = assert_exchange()
+    assert stop.outcome == :sent
+    assert stop.reason == :caller_closed
+  end
+
+  test "an ordinary successful request still reports outcome :ok" do
+    TelemetryCapture.attach()
+
+    conn = call("GET", "/_ping", engine(fixed_response(200, "")))
+
+    assert %{status: 200} = conn
+
+    assert %{stop: {_, stop}} = assert_exchange()
+    assert stop.outcome == :ok
+    assert stop.reason == nil
+  end
+
   defp count_payload("0\r\n\r\n", total), do: total
 
   defp count_payload(chunks, total) do
@@ -398,6 +442,16 @@ defmodule Opsmaru.Containers.Docker.PlugTest do
     <<bytes::binary-size(length), "\r\n", rest::binary>> = data
     assert bytes == :binary.copy(<<42>>, length)
     count_payload(rest, total + length)
+  end
+
+  defp call_with_failing_adapter(method, path, context) do
+    conn =
+      method
+      |> Test.conn(path)
+      |> Conn.put_private(:opsmaru_containers_peer, {context, :allow})
+      |> Map.put(:adapter, {FailingStreamAdapter, %{}})
+
+    Plug.call(conn, Plug.init(host: Policy))
   end
 
   defp call(method, path, context, body \\ "", decision \\ :allow, options \\ []) do
