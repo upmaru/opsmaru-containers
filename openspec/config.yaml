@@ -14,8 +14,8 @@ context: |
   and the transport to the guest; the library never probes sockets, runs host
   commands or keeps a database. Engine metadata lives on Incus objects under
   user.opsmaru.containers.* keys. Two engines sit behind one API: a nested
-  engine (dockerd in an Incus system container; full compatibility and all
-  builds) and a planned native engine (Incus OCI application containers) that
+  engine (dockerd in an Incus system container for verified Docker routes)
+  and a planned native engine (Incus OCI application containers) that
   takes over endpoints one at a time. Preserve the engine API's routes,
   version negotiation, error shapes and streaming/hijack semantics, and never
   replay a possibly accepted mutation. Fixture, real-engine differential,

@@ -1,0 +1,27 @@
+{
+  "engine": {
+    "version": "29.10.0",
+    "commit": "06db1734267bf7770914b417bff6556d835bf8cc",
+    "min_api_version": "1.40",
+    "max_api_version": "1.57"
+  },
+  "openapi": {
+    "path": "openapi.yaml.gz",
+    "url": "https://raw.githubusercontent.com/moby/moby/06db1734267bf7770914b417bff6556d835bf8cc/api/openapi.yaml",
+    "sha256": "f66511e393c9f21f037ab09dae2c0e5a10bdd5c9fc3a26d22e06035df68e9ac1",
+    "license": "Apache-2.0"
+  },
+  "cli": {
+    "version": "29.10.0",
+    "commit": "fdd4b8e5da335e1d0d83d29af5045f57280cd694"
+  },
+  "compose": {
+    "version": "5.8.0",
+    "commit": "aee88dcde588d9dc7d8d2902f97b6b5502fdb771"
+  },
+  "buildx": {
+    "version": "0.39.1",
+    "commit": "334b63fe2bb0f0e89a8fd067704a0d113f57ec25",
+    "driver": "docker"
+  }
+}
