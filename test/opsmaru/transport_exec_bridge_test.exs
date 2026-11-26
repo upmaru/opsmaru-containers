@@ -342,6 +342,31 @@ defmodule Opsmaru.Containers.Transport.ExecBridgeTest do
     assert ExecBridge.recv(handle, 1_024, deadline()) == {:ok, "out"}
   end
 
+  test "an exec session setup that misses the dial deadline is abandoned" do
+    session = Fake.start(self())
+    Fake.stall_exec(session)
+    started = System.monotonic_time(:millisecond)
+
+    assert ExecBridge.dial(target(), options(), deadline(100)) == {:error, {:exec, :deadline}}
+    assert System.monotonic_time(:millisecond) - started < 1_000
+
+    # The setup process, which would own the session's channels, is gone.
+    assert_received {:incus, {:exec_stalled, holder}}
+    monitor = Process.monitor(holder)
+    assert_receive {:DOWN, ^monitor, :process, ^holder, reason}, 500
+    assert reason in [:killed, :noproc]
+  end
+
+  test "the setup process holds the session until close releases it" do
+    {_session, handle} = connected("")
+    {holder, _ref} = handle.holder
+    assert Process.alive?(holder)
+
+    monitor = Process.monitor(holder)
+    assert ExecBridge.close(handle) == :ok
+    assert_receive {:DOWN, ^monitor, :process, ^holder, :normal}, 500
+  end
+
   test "helper stderr is still drained after the dial deadline has passed" do
     session = Fake.start(self(), stderr: [])
     Fake.push(session, "1", {:binary, "OCB1"})

@@ -42,6 +42,11 @@ defmodule Opsmaru.Containers.Transport.ExecBridge do
   Type 1 has length 0 and ends output only. Anything else is a stream error.
   The relay sees only peer bytes and directional EOF.
 
+  Creating the exec session and opening its channels ends by the dial
+  deadline. A setup that misses it is abandoned with
+  `{:error, {:exec, :deadline}}` and any channels it opened are closed. An
+  exec Incus already accepted is neither deleted nor retried.
+
   Closing a stream signals an incomplete helper with SIGTERM, waits up to
   three seconds and closes the session channels. It never sends an Incus
   DELETE and never retries.
@@ -81,12 +86,82 @@ defmodule Opsmaru.Containers.Transport.ExecBridge do
         "record-output" => false
       }
 
-      case opts.incus.exec(opts.client, target.instance, request) do
-        {:ok, session} -> start_stream(session, opts, deadline)
-        {:error, reason} -> {:error, {:exec, reason}}
+      case exec(opts, target.instance, request, deadline) do
+        {:ok, session, holder} -> start_stream(session, holder, opts, deadline)
+        {:error, _} = error -> error
       end
     end
   end
+
+  # --- Session setup ----------------------------------------------------------
+
+  # Creating the exec and opening its channels is bounded by the connection's
+  # own timeouts, which may outlast the dial deadline. Run it in a holder
+  # process and wait no longer than the deadline. The holder creates the
+  # channels, so it owns them: it lives until `close/1` releases it or the
+  # dialing process exits. A setup that misses the deadline is killed, which
+  # closes any channels it opened. An exec Incus already accepted is neither
+  # deleted nor retried.
+  defp exec(opts, instance, request, deadline) do
+    caller = self()
+    ref = make_ref()
+    callers = [caller | Process.get(:"$callers", [])]
+
+    holder =
+      spawn(fn ->
+        Process.put(:"$callers", callers)
+        owner = Process.monitor(caller)
+
+        Kernel.send(
+          caller,
+          {ref, guard(fn -> opts.incus.exec(opts.client, instance, request) end)}
+        )
+
+        hold(ref, owner)
+      end)
+
+    monitor = Process.monitor(holder)
+
+    receive do
+      {^ref, {:ok, session}} ->
+        Process.demonitor(monitor, [:flush])
+        {:ok, session, {holder, ref}}
+
+      {^ref, {:error, reason}} ->
+        Process.demonitor(monitor, [:flush])
+        {:error, {:exec, reason}}
+
+      {^ref, other} ->
+        Process.demonitor(monitor, [:flush])
+        {:error, {:exec, other}}
+
+      {:DOWN, ^monitor, :process, ^holder, reason} ->
+        {:error, {:exec, reason}}
+    after
+      max(deadline - now(), 0) ->
+        Process.exit(holder, :kill)
+        Process.demonitor(monitor, [:flush])
+
+        receive do
+          {^ref, _} -> :ok
+        after
+          0 -> :ok
+        end
+
+        {:error, {:exec, :deadline}}
+    end
+  end
+
+  defp hold(ref, owner) do
+    receive do
+      {^ref, :release} -> :ok
+      {:DOWN, ^owner, :process, _, _} -> :ok
+      _ -> hold(ref, owner)
+    end
+  end
+
+  defp release(%{holder: {pid, ref}}), do: Kernel.send(pid, {ref, :release})
+  defp release(_), do: :ok
 
   # --- Options ----------------------------------------------------------------
 
@@ -189,7 +264,7 @@ defmodule Opsmaru.Containers.Transport.ExecBridge do
 
   # --- Setup ------------------------------------------------------------------
 
-  defp start_stream(session, opts, deadline) do
+  defp start_stream(session, holder, opts, deadline) do
     {:ok, buffer} = Agent.start_link(fn -> "" end)
 
     handle = %{
@@ -200,7 +275,8 @@ defmodule Opsmaru.Containers.Transport.ExecBridge do
       limits: opts.limits,
       counters: :atomics.new(2, signed: false),
       keepalive: nil,
-      stderr: nil
+      stderr: nil,
+      holder: holder
     }
 
     # Stderr is drained for the life of the session, not until the dial
@@ -411,6 +487,7 @@ defmodule Opsmaru.Containers.Transport.ExecBridge do
     end
 
     guard(fn -> incus.close(session) end)
+    release(handle)
     guard(fn -> Agent.stop(handle.buffer) end)
     :ok
   end
