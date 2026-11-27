@@ -121,7 +121,8 @@ defmodule Mix.Tasks.Docker.Reference do
     expected = Enum.map(routes, route_identity)
 
     unless Enum.map(entries, route_identity) == expected and
-             Enum.all?(entries, &evidence_entry?/1),
+             Enum.all?(entries, &evidence_entry?/1) and
+             Enum.all?(Enum.zip(routes, entries), &native_evidence?/1),
            do: Mix.raise("Evidence ledger does not match the Docker route inventory")
   end
 
@@ -130,6 +131,21 @@ defmodule Mix.Tasks.Docker.Reference do
       records = Map.get(entry, field)
       is_list(records) and Enum.all?(records, &(is_binary(&1) and &1 != ""))
     end)
+  end
+
+  # A route that serves native containers keeps their evidence apart, so
+  # nested passthrough evidence never counts for native containers.
+  defp native_evidence?({route, entry}) do
+    case {Map.has_key?(route, "native"), Map.get(entry, "native")} do
+      {false, nil} ->
+        true
+
+      {true, %{} = native} ->
+        Map.keys(native) |> Enum.sort() == Enum.sort(@evidence_fields) and evidence_entry?(native)
+
+      _ ->
+        false
+    end
   end
 
   @native_classes %{"translated" => "to", "ignored" => "reason", "refused" => "reason"}

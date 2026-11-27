@@ -102,9 +102,9 @@ defmodule Opsmaru.Containers.Native.Logs do
   """
   def stream(native, container, options, emit, deadline) do
     with {:ok, state} <- Lifecycle.instance_state(native, container, deadline),
+         follow? = options.follow and state["status"] in @running,
+         {:ok, options} <- followed_run(native, container, options, follow?, deadline),
          {:ok, session} <- open(native, container, deadline) do
-      follow? = options.follow and state["status"] in @running
-
       try do
         with {:ok, position} <- initial(native, container, session, options, emit),
              :ok <- emit.(:begin) do
@@ -119,6 +119,51 @@ defmodule Opsmaru.Containers.Native.Logs do
     |> case do
       :halt -> :ok
       other -> other
+    end
+  end
+
+  # A follow ends with the run in progress, or the next one when the shim
+  # has not recorded it yet.
+  defp followed_run(_, _, options, false, _), do: {:ok, options}
+
+  defp followed_run(native, container, options, true, deadline) do
+    with {:ok, record} <- Lifecycle.record(native, container, deadline) do
+      {:ok, Map.put(options, :run, current_run(record))}
+    end
+  end
+
+  defp current_run(%RunRecord{run: run, finished_at: nil, error: nil}), do: run
+  defp current_run(%RunRecord{run: run}), do: run + 1
+  defp current_run(_), do: 1
+
+  # An SFTP session open on an instance holds up Incus's stop of it (and its
+  # start) until the session ends. Followers therefore read the run record
+  # over their own session on every poll, and close the session as soon as
+  # the run they follow has finished, before Incus stops the instance.
+  defp finished?(native, session, run) do
+    case native.backend.sftp_read(session, RunRecord.path(), 0, RunRecord.limit()) do
+      {:ok, data} ->
+        case RunRecord.parse(data) do
+          %RunRecord{run: recorded} when recorded > run -> true
+          %RunRecord{run: ^run, finished_at: nil, error: nil} -> false
+          %RunRecord{run: ^run} -> true
+          _ -> false
+        end
+
+      _ ->
+        false
+    end
+  end
+
+  # Waits, holding no session, until the instance has stopped.
+  defp until_stopped(native, container, emit, deadline) do
+    case Lifecycle.instance_state(native, container, deadline) do
+      {:ok, %{"status" => status}} when status in @running ->
+        with :ok <- wait(@attach_poll, emit, deadline),
+             do: until_stopped(native, container, emit, deadline)
+
+      _ ->
+        :ok
     end
   end
 
@@ -168,12 +213,19 @@ defmodule Opsmaru.Containers.Native.Logs do
   end
 
   defp followed({:ok, _, position}, native, container, session, _, options, emit, deadline) do
-    case Lifecycle.instance_state(native, container, deadline) do
-      {:ok, %{"status" => status}} when status in @running ->
-        follow(native, container, session, position, options, emit, deadline)
+    if finished?(native, session, options.run) do
+      close(native, session)
 
-      _ ->
-        final(native, container, session, position, options, emit, deadline)
+      with :ok <- until_stopped(native, container, emit, deadline),
+           do: final(native, container, nil, position, options, emit, deadline)
+    else
+      case Lifecycle.instance_state(native, container, deadline) do
+        {:ok, %{"status" => status}} when status in @running ->
+          follow(native, container, session, position, options, emit, deadline)
+
+        _ ->
+          final(native, container, session, position, options, emit, deadline)
+      end
     end
   end
 
@@ -350,11 +402,26 @@ defmodule Opsmaru.Containers.Native.Logs do
     end
   end
 
+  # Once the awaited run has finished, the session is closed and the attach
+  # waits, holding none, for Incus to stop the instance.
+  defp attach_step({:ok, %{"status" => status}}, pipe, %{exited: true} = follower, position, _)
+       when status in @running do
+    Process.sleep(@attach_poll)
+    attached(pipe, follower, position, nil)
+  end
+
   defp attach_step({:ok, %{"status" => status}}, pipe, follower, position, session)
        when status in @running do
     {position, session} = attach_read(pipe, follower, position, session)
-    Process.sleep(@attach_poll)
-    attached(pipe, follower, position, session)
+
+    if session != nil and finished?(follower.native, session, follower.target) do
+      close(follower.native, session)
+      Process.sleep(@attach_poll)
+      attached(pipe, Map.put(follower, :exited, true), position, nil)
+    else
+      Process.sleep(@attach_poll)
+      attached(pipe, follower, position, session)
+    end
   end
 
   defp attach_step({:ok, _}, pipe, follower, position, session) do

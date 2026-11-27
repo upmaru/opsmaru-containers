@@ -367,6 +367,26 @@ defmodule Opsmaru.Containers.Native.TranslateTest do
              Translate.prepare(body, fn _ -> :deny end)
   end
 
+  test "the stored HostConfig and mount summary carry the mapped bind sources" do
+    body = %{
+      "Image" => "a",
+      "HostConfig" => %{
+        "Binds" => ["/data:/data:ro", "/logs:/var/log"],
+        "Mounts" => [%{"Type" => "bind", "Source" => "/src", "Target" => "/mnt"}]
+      }
+    }
+
+    assert {:ok, prepared} = Translate.prepare(body, &{:ok, "/host" <> &1})
+    assert prepared.host["Binds"] == ["/host/data:/data:ro", "/host/logs:/var/log"]
+    assert [%{"Source" => "/host/src", "Target" => "/mnt"}] = prepared.host["Mounts"]
+
+    assert Enum.map(prepared.mounts, &{&1["Source"], &1["Destination"]}) == [
+             {"/host/data", "/data"},
+             {"/host/logs", "/var/log"},
+             {"/host/src", "/mnt"}
+           ]
+  end
+
   defp put_field(body, field, value) do
     case String.split(field, ".") do
       [name] -> Map.put(body, name, value)

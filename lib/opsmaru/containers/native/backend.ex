@@ -78,6 +78,7 @@ defmodule Opsmaru.Containers.Native.Incus do
   @moduledoc false
   @behaviour Opsmaru.Containers.Native.Backend
 
+  alias Opsmaru.Containers.Native.Container
   alias Opsmaru.Incus
 
   alias Opsmaru.Incus.{
@@ -90,7 +91,8 @@ defmodule Opsmaru.Containers.Native.Incus do
     RequestContext,
     Response,
     Session,
-    SFTP
+    SFTP,
+    Transfer
   }
 
   @max_exec_output 1_048_576
@@ -129,8 +131,8 @@ defmodule Opsmaru.Containers.Native.Incus do
   def stream_file(client, instance, path, sink, deadline) do
     with {:ok, client} <- scope(client, deadline) do
       case Files.read(client, instance, path, sink) do
-        {:ok, %{type: "file"}} -> :ok
-        {:ok, _} -> {:error, :not_a_file}
+        {:ok, %Transfer{result: %{type: "file"}}} -> :ok
+        {:ok, %Transfer{}} -> {:error, :not_a_file}
         {:error, %Error{http_status: 404}} -> {:error, :not_found}
         {:error, %Error{kind: :sink_failed}} -> {:error, :too_large}
         {:error, _} = error -> error
@@ -141,10 +143,15 @@ defmodule Opsmaru.Containers.Native.Incus do
   @impl true
   def delete_instance(client, instance, deadline) do
     with {:ok, client} <- scope(client, deadline) do
-      client
-      |> Incus.call("DeleteInstance", %{"name" => instance})
-      |> await(client)
-      |> ok()
+      case Incus.call(client, "DeleteInstance", %{"name" => instance}) do
+        # Incus reports an OCI instance stopped shortly before it accepts the
+        # delete. The caller retries this refusal.
+        {:error, %Error{kind: :native, http_status: 400, message: "Instance is running"}} ->
+          {:error, :running}
+
+        result ->
+          result |> await(client) |> ok()
+      end
     end
   end
 
@@ -239,10 +246,43 @@ defmodule Opsmaru.Containers.Native.Incus do
   def instance_state(client, instance, deadline) do
     with {:ok, client} <- scope(client, deadline) do
       case Incus.call(client, "GetInstanceState", %{"name" => instance}) do
-        {:ok, %Response{metadata: %Model{data: state}}} -> {:ok, state}
-        {:error, %Error{http_status: 404}} -> {:error, :not_found}
-        {:error, _} = error -> error
+        {:ok, %Response{metadata: %Model{data: %{"status" => "Stopped"} = state}}} ->
+          confirm_stopped(client, instance, state)
+
+        {:ok, %Response{metadata: %Model{data: state}}} ->
+          {:ok, state}
+
+        {:error, %Error{http_status: 404}} ->
+          {:error, :not_found}
+
+        # Once an OCI instance's init exits, Incus 7.0.1 fails the state read
+        # with "Invalid PID -1" for about 700 ms, until the stop completes.
+        # The instance is stopping then. (`GetInstance` is no help: its status
+        # flips between Running and Stopped in that window.)
+        {:error, %Error{kind: :native, http_status: 500, message: "Invalid PID" <> _}} ->
+          {:ok, %{"status" => "Stopping"}}
+
+        {:error, _} = error ->
+          error
       end
+    end
+  end
+
+  # The state can read Stopped for a moment before the stop completes (see
+  # `Container.status/2`), so a Stopped state is confirmed by the instance.
+  defp confirm_stopped(client, instance, state) do
+    case Incus.call(client, "GetInstance", %{"name" => instance}) do
+      {:ok, %Response{metadata: %Model{data: %{"config" => config}}}} when is_map(config) ->
+        {:ok, Map.put(state, "status", Container.status("Stopped", config))}
+
+      {:error, %Error{http_status: 404}} ->
+        {:error, :not_found}
+
+      {:error, _} = error ->
+        error
+
+      {:ok, _} ->
+        {:error, :invalid_response}
     end
   end
 
@@ -259,23 +299,47 @@ defmodule Opsmaru.Containers.Native.Incus do
   end
 
   @impl true
+  # opsmaru_incus sends PatchInstance only as a conditional write, so the
+  # instance's ETag is read first. A write that lost a race to another change
+  # (412) is read and sent again: each patch names only its own keys.
   def patch_config(client, instance, config, deadline) do
-    with {:ok, client} <- scope(client, deadline) do
-      case Incus.call(client, "PatchInstance", %{"name" => instance}, body: %{"config" => config}) do
-        {:ok, _} ->
-          :ok
+    with {:ok, client} <- scope(client, deadline), do: patch_etag(client, instance, config, 5)
+  end
 
-        {:error, %Error{http_status: 404}} ->
-          {:error, :not_found}
+  defp patch_etag(client, instance, config, attempts) do
+    case Incus.call(client, "GetInstance", %{"name" => instance}) do
+      {:ok, %Response{etag: etag}} when etag != "" ->
+        client
+        |> Incus.call("PatchInstance", %{"name" => instance},
+          body: %{"config" => config},
+          etag: etag
+        )
+        |> patched(client, instance, config, attempts)
 
-        {:error, %Error{kind: :native, http_status: status}} when status < 500 ->
-          {:error, :rejected}
+      {:error, %Error{http_status: 404}} ->
+        {:error, :not_found}
 
-        {:error, _} ->
-          {:error, :uncertain}
-      end
+      {:ok, %Response{}} ->
+        {:error, :rejected}
+
+      {:error, _} = error ->
+        error
     end
   end
+
+  defp patched({:ok, _}, _, _, _, _), do: :ok
+
+  defp patched({:error, %Error{http_status: 412}}, client, instance, config, attempts)
+       when attempts > 1,
+       do: patch_etag(client, instance, config, attempts - 1)
+
+  defp patched({:error, %Error{http_status: 404}}, _, _, _, _), do: {:error, :not_found}
+
+  defp patched({:error, %Error{kind: :native, http_status: status}}, _, _, _, _)
+       when status < 500,
+       do: {:error, :rejected}
+
+  defp patched({:error, _}, _, _, _, _), do: {:error, :uncertain}
 
   @impl true
   def head_file(client, instance, path, deadline) do
@@ -293,7 +357,7 @@ defmodule Opsmaru.Containers.Native.Incus do
     {type, source} =
       if content == :directory,
         do: {"directory", []},
-        else: {"file", [IO.iodata_to_binary(content)]}
+        else: {"file", chunks(IO.iodata_to_binary(content))}
 
     with {:ok, client} <- scope(client, deadline) do
       case Files.create(client, instance, path, source, type: type, mode: mode, uid: 0, gid: 0) do
@@ -308,6 +372,14 @@ defmodule Opsmaru.Containers.Native.Incus do
       end
     end
   end
+
+  # opsmaru_incus 0.2.10 reports a multi-megabyte single-chunk upload as
+  # uncertain against real Incus, while the same bytes in 64 KiB chunks
+  # succeed. The Incus CLI also streams files in pieces.
+  @push_chunk 65_536
+  defp chunks(<<chunk::binary-size(@push_chunk), rest::binary>>), do: [chunk | chunks(rest)]
+  defp chunks(""), do: []
+  defp chunks(chunk), do: [chunk]
 
   @impl true
   def subscribe(client, deadline) do

@@ -96,7 +96,7 @@ defmodule Opsmaru.Containers.Native.Container do
          autoremove: config[@prefix <> "autoremove"] == "true",
          labels: labels,
          config: create_config,
-         status: data["status"],
+         status: status(data["status"], config),
          base_image: config["volatile.base_image"],
          execs: execs(config)
        }}
@@ -106,6 +106,15 @@ defmodule Opsmaru.Containers.Native.Container do
   end
 
   def from_instance(_), do: :ignore
+
+  @doc """
+  The status to act on. While an OCI instance stops, Incus 7.0.1 can report
+  `Stopped` before its stop hook finishes, then `Running` again. The hook sets
+  `volatile.last_state.power` to `STOPPED` when it finishes, so a stopped
+  status with power still `RUNNING` is `Stopping`.
+  """
+  def status("Stopped", %{"volatile.last_state.power" => "RUNNING"}), do: "Stopping"
+  def status(status, _config), do: status
 
   @doc "The native containers among listed instances, ignoring every other instance."
   def from_instances(instances) do

@@ -24,6 +24,10 @@ defmodule Opsmaru.Containers.TestSupport.ScriptedIncus do
       `echo: true` echoes stdin to channel 1 (0 when interactive) until
       stdin closes
     * `:operations` - `%{url => %{done: boolean, exit_code: code}}`
+    * `:delete_refusals` - how many deletes Incus refuses as running first,
+      as it does just after an OCI instance stops
+    * `:read_failures` - how many file reads fail first, as they do while an
+      instance starts or stops
   """
 
   @behaviour Opsmaru.Containers.Native.Backend
@@ -44,7 +48,9 @@ defmodule Opsmaru.Containers.TestSupport.ScriptedIncus do
       events: [],
       image_files: [],
       session: fn _, _ -> %{output: [], exit: 0} end,
-      operations: %{}
+      operations: %{},
+      delete_refusals: 0,
+      read_failures: 0
     }
 
     {:ok, agent} =
@@ -84,6 +90,13 @@ defmodule Opsmaru.Containers.TestSupport.ScriptedIncus do
   def read_file(client, instance, path, limit, _deadline) do
     report(client, {:read_file, instance, path})
 
+    case take(client, :read_failures) do
+      :refused -> {:error, :unavailable}
+      :ok -> read_scripted(client, instance, path, limit)
+    end
+  end
+
+  defp read_scripted(client, instance, path, limit) do
     case Map.get(get(client, :files), {instance, path}, {:error, :not_found}) do
       bytes when is_binary(bytes) and byte_size(bytes) <= limit -> {:ok, bytes}
       bytes when is_binary(bytes) -> {:error, :too_large}
@@ -96,9 +109,16 @@ defmodule Opsmaru.Containers.TestSupport.ScriptedIncus do
     report(client, {:stream_file, instance, path})
 
     case Map.get(get(client, :files), {instance, path}, {:error, :not_found}) do
-      bytes when is_binary(bytes) -> deliver(chunks(bytes, 4096), sink)
+      bytes when is_binary(bytes) -> deliver_elsewhere(chunks(bytes, 4096), sink)
       error -> error
     end
+  end
+
+  # opsmaru_incus calls a download sink from its transfer worker, not from the
+  # caller, so the scripted backend does too.
+  defp deliver_elsewhere(chunks, sink) do
+    task = Task.async(fn -> deliver(chunks, sink) end)
+    Task.await(task, :infinity)
   end
 
   defp deliver([], _), do: :ok
@@ -111,11 +131,27 @@ defmodule Opsmaru.Containers.TestSupport.ScriptedIncus do
   def delete_instance(client, instance, _deadline) do
     report(client, {:delete_instance, instance})
 
-    update(client, fn state ->
-      %{state | instances: Enum.reject(state.instances, &(&1["name"] == instance))}
-    end)
+    case take(client, :delete_refusals) do
+      :refused ->
+        {:error, :running}
 
-    :ok
+      :ok ->
+        update(client, fn state ->
+          %{state | instances: Enum.reject(state.instances, &(&1["name"] == instance))}
+        end)
+
+        :ok
+    end
+  end
+
+  # Counts down a scripted failure: `:refused` while any remain.
+  defp take(%Incus{server: agent}, key) do
+    Agent.get_and_update(agent, fn state ->
+      case Map.fetch!(state, key) do
+        0 -> {:ok, state}
+        n -> {:refused, Map.put(state, key, n - 1)}
+      end
+    end)
   end
 
   @impl true

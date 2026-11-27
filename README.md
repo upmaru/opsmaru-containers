@@ -9,7 +9,11 @@ against an Incus backend.
 **Status: Docker foundation in development.** Host embedding, nested engine
 lifecycle, and HTTP and raw relay paths have fixture coverage. Real-engine,
 real-Incus and Macus acceptance are tracked in the
-[OpenSpec change](openspec/changes/add-docker-engine-foundation).
+[OpenSpec change](openspec/changes/add-docker-engine-foundation). Native
+containers have fixture, real-Incus and differential evidence on arm64 and
+are tracked in
+[add-native-oci-engine](openspec/changes/add-native-oci-engine); host
+acceptance has not been run.
 
 ## Design in brief
 
@@ -22,8 +26,17 @@ real-Incus and Macus acceptance are tracked in the
 - **Incus is the only backend.** Everything goes through `opsmaru_incus`. The
   library keeps no database; engine metadata lives on Incus objects.
 - **Nested Docker first.** The relay targets dockerd inside an Incus system
-  container. A later native engine based on Incus OCI application containers
-  can take over selected routes.
+  container. That engine stays the image store and serves everything the
+  native engine does not.
+- **Native containers, opt in.** A host can run selected containers as Incus
+  OCI application containers instead, visible to Incus tooling. A small init
+  shim, which the host builds, runs inside each one: it starts the exact
+  Docker argv, records exit status and writes the logs. Images are copied
+  from dockerd with `skopeo` and `umoci` in the engine. Fields and routes the
+  native engine cannot honour are refused by name, never sent to nested
+  instead, and Compose projects should stay nested. See
+  [native containers](docs/embedding.md#route-containers-to-the-native-engine)
+  for the translation, the refusals and the recorded differences from Docker.
 
 ## Development
 

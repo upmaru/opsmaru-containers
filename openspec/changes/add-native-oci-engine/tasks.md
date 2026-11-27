@@ -131,7 +131,7 @@ Tasks 2.1 and 2.2 are library code with unit tests. Tasks 2.3 to 2.10 run with e
 
 ## 7. Evidence and documentation
 
-- [ ] 7.1 Add differential cases that run the same pinned CLI workflow against a nested and a native container from the same image:
+- [x] 7.1 Add differential cases that run the same pinned CLI workflow against a nested and a native container from the same image:
   - run with an exit code, foreground and `--rm`;
   - detached run with stop and rm, and kill with a signal;
   - exec with stdin EOF and with a named user;
@@ -139,11 +139,15 @@ Tasks 2.1 and 2.2 are library code with unit tests. Tasks 2.3 to 2.10 run with e
   - inspect fields, rename, a bind mount and limits.
 
   Normalise only the recorded differences.
-- [ ] 7.2 With explicit opt-in, run the native workflows against isolated Incus 7.0.1 and record them in the ledger as real-Incus evidence. Leave unchecked until run.
-- [ ] 7.3 Document native containers in the README and `docs/embedding.md`:
+  - Result: `test/acceptance/native_differential.mjs` runs seven cases through the pinned CLI against two sockets of one listener (`scripts/acceptance/native_listener.exs`), which differ only in the engine chosen at create. It compares exit codes, stdout, stderr, the `State`, `Config`, `HostConfig` and `Mounts` fields the table translates, and in-container checks of identity, hostname, cwd, env, the bind and cgroup limits. It normalises only container IDs, generated names (a recorded difference) and its run tag. The trapped-TERM stop keeps the Init difference out of the comparison.
+- [x] 7.2 With explicit opt-in, run the native workflows against isolated Incus 7.0.1 and record them in the ledger as real-Incus evidence. Leave unchecked until run.
+  - Run 2026-11-27 ([acceptance report](../../../docs/native-oci-acceptance.md)) on arm64 with Docker 29.10.0 and shim `30d1d3ab…`. The differential passed 21 of 21 runs on the final code, with native timings within a second or two of nested. Native-only checks passed for pause, unpause, restart, `logs --since`, listing filters, output-only `docker attach`, `start -a`, prune, TTY exec size and resize, and the refusals of `cp`, `stats`, `top`, `export`, `diff`, `update`, `run -i` and `run -p`. A resize that reached an exec after it ended got 409 natively and 404 from dockerd, so native now gives dockerd's answer. Real-Incus findings were fixed along the way: a held SFTP session blocking stops (34 s foreground runs and 67 s log follows before), flapping stop state, delete and file-read refusals around state changes, the start window, file-retrieved event storms, mapped bind sources in inspect and the image producer's cross-process sink each have a fixture test that fails without the fix. Conditional patches, 64 KiB chunked pushes, the `Invalid PID` 500 and the download result's shape are fixed in `Native.Incus`, which is exercised only against real Incus. `priv/docker/coverage.json` now keeps a `native` evidence object on every route with a `native` field, checked by `mix docker.reference`, and records fixture, differential and real-Incus evidence there from the routes the listener's telemetry saw: 14 translated routes have all three; pause, unpause, restart, prune and exec resize lack a differential case, so they are not verified for native. **The run used `opsmaru_incus` 0.2.10 patched locally** to open exec sessions' `control` channel first. Unpatched, the image handoff failed every time. A fixed `opsmaru_incus` release is a precondition for shipping native containers. linux/amd64 and host acceptance were not run.
+- [x] 7.3 Document native containers in the README and `docs/embedding.md`:
   - how to opt in, and how to build and pass the shim;
   - the engine's skopeo and umoci requirement, and root size on ZFS;
   - the translation table, what is refused and why, and the recorded differences, including container-written logs and exit status;
   - double image storage and pruning;
   - that Compose should stay nested.
-- [ ] 7.4 Run `mise run check`.
+  - Result: the README's design summary and status cover native containers. `docs/embedding.md` has opt-in, shim, engine and project preparation, translation and refusals, recorded differences (container-written logs and exit status, forced stops, init, hostname files, health checks, volumes, `/dev/shm`, names, listing), images and auto-remove, keeping Compose nested, and how to run the native acceptance.
+- [x] 7.4 Run `mise run check`.
+  - Result: passed, with 263 tests, the reference and ledger check, strict OpenSpec validation and both Go helper checks.

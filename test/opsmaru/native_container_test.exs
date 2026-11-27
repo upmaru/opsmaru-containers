@@ -75,6 +75,15 @@ defmodule Opsmaru.Containers.Native.ContainerTest do
     assert [%Container{id: ^id}] = Container.from_instances([engine, instance.(keys)])
   end
 
+  test "a stopped status is stopping until Incus records the power state as stopped" do
+    # Incus 7.0.1 reports an OCI instance stopped while its stop hook still
+    # runs, and records the power state when the hook finishes.
+    assert Container.status("Stopped", %{"volatile.last_state.power" => "RUNNING"}) == "Stopping"
+    assert Container.status("Stopped", %{"volatile.last_state.power" => "STOPPED"}) == "Stopped"
+    assert Container.status("Stopped", %{}) == "Stopped"
+    assert Container.status("Running", %{"volatile.last_state.power" => "RUNNING"}) == "Running"
+  end
+
   test "names follow Docker's rule" do
     assert Container.valid_name?("web")
     assert Container.valid_name?("/web-1.blue_2")

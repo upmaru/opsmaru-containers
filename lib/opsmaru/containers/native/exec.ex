@@ -439,7 +439,12 @@ defmodule Opsmaru.Containers.Native.Exec do
   defp resized({:error, :not_tty}, id), do: {:error, 409, "exec #{id} has no TTY to resize"}
   defp resized(_, id), do: {:error, 409, "exec #{id} is not running"}
 
-  defp not_running(id, %{"Started" => true}), do: {:error, 409, "exec #{id} is not running"}
+  # dockerd answers a resize for an exec whose process has exited with
+  # containerd's not-found error, so the CLI's late resize of a short TTY
+  # exec gets the same answer from both engines.
+  defp not_running(id, %{"Started" => true}),
+    do: {:error, 404, "NotFound: process does not exist #{id}: not found"}
+
   defp not_running(id, _), do: {:error, 409, "exec #{id} has not started"}
 
   defp dimension(value, key) do

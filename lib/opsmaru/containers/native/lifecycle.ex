@@ -21,6 +21,8 @@ defmodule Opsmaru.Containers.Native.Lifecycle do
   }
 
   @poll 100
+  @record_attempts 5
+  @record_pause 200
   @default_stop 10
   @backstop 10_000
   @exec_grace 2_000
@@ -459,11 +461,27 @@ defmodule Opsmaru.Containers.Native.Lifecycle do
   end
 
   @doc false
+  # Incus can report an OCI instance as stopped a moment before it accepts
+  # the delete, and refuses it as running until then. That refusal alone is
+  # retried, within the deadline.
   def delete(native, container, deadline) do
     case native.backend.delete_instance(native.client, container.instance, deadline) do
-      :ok -> :ok
-      {:error, :not_found} -> :ok
-      _ -> {:error, 500, "native engine: Incus could not delete container #{container.id}"}
+      :ok ->
+        :ok
+
+      {:error, :not_found} ->
+        :ok
+
+      {:error, :running} ->
+        if System.monotonic_time(:millisecond) + @poll < deadline do
+          Process.sleep(@poll)
+          delete(native, container, deadline)
+        else
+          {:error, 500, "native engine: Incus could not delete container #{container.id}"}
+        end
+
+      _ ->
+        {:error, 500, "native engine: Incus could not delete container #{container.id}"}
     end
   end
 
@@ -598,10 +616,25 @@ defmodule Opsmaru.Containers.Native.Lifecycle do
   # -- Shared --------------------------------------------------------------------
 
   @doc false
-  def record(native, container, deadline) do
+  # The files API can fail while an instance starts or stops (Incus 7.0.1
+  # answers 500 when its fork helper's socket resets), and a failed read can
+  # take seconds to fail. A failed read is retried up to four times, 200 ms
+  # apart, within the deadline.
+  def record(native, container, deadline),
+    do: record(native, container, deadline, @record_attempts)
+
+  defp record(native, container, deadline, attempts) do
     case RunRecord.read(native, container, deadline) do
-      {:ok, record} -> {:ok, record}
-      {:error, _} -> {:error, 503, "native engine: Incus is not available"}
+      {:ok, record} ->
+        {:ok, record}
+
+      {:error, _} ->
+        if attempts > 1 and now() + @record_pause < deadline do
+          Process.sleep(@record_pause)
+          record(native, container, deadline, attempts - 1)
+        else
+          {:error, 503, "native engine: Incus is not available"}
+        end
     end
   end
 

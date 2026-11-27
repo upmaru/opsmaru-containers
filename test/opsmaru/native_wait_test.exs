@@ -93,6 +93,61 @@ defmodule Opsmaru.Containers.Native.WaitTest do
              Wait.run(waiter, deadline(), fn -> false end)
   end
 
+  test "a run without an exit while Incus still reports the start as stopped is not final", %{
+    context: context,
+    native: native
+  } do
+    # Incus 7.0.1 reports an OCI instance stopped while it starts, after the
+    # shim has already recorded the run.
+    {:ok, waiter} = Wait.begin(context, container(native, @web), :next_exit, deadline())
+    ScriptedIncus.update(native, &ScriptedIncus.put_status(&1, @web_instance, "Stopped"))
+    ScriptedIncus.event(native, ScriptedIncus.lifecycle(@web_instance, "instance-stopped"))
+
+    task = Task.async(fn -> Wait.run(waiter, deadline(), fn -> false end) end)
+    Process.sleep(600)
+    assert Task.yield(task, 0) == nil
+
+    ScriptedIncus.update(
+      native,
+      &ScriptedIncus.put_file(&1, @web_instance, @record, record(1, 4))
+    )
+
+    ScriptedIncus.event(native, ScriptedIncus.lifecycle(@web_instance, "instance-shutdown"))
+
+    assert {:ok, %{"StatusCode" => 4}} = Task.await(task)
+    Wait.close(waiter)
+  end
+
+  test "file retrieval events do not wake the wait", %{context: context, native: native} do
+    # Every file read, the wait's own included, emits instance-file-retrieved.
+    {:ok, waiter} = Wait.begin(context, container(native, @web), :next_exit, deadline())
+
+    for _ <- 1..20,
+        do:
+          ScriptedIncus.event(
+            native,
+            ScriptedIncus.lifecycle(@web_instance, "instance-file-retrieved")
+          )
+
+    _ = messages()
+    task = Task.async(fn -> Wait.run(waiter, deadline(), fn -> false end) end)
+    Process.sleep(400)
+    assert Task.yield(task, 0) == nil
+
+    reads = for {:incus, {:read_file, @web_instance, @record}} <- messages(), do: :read
+    assert length(reads) <= 2
+
+    ScriptedIncus.update(native, fn state ->
+      state
+      |> ScriptedIncus.put_file(@web_instance, @record, record(1, 0))
+      |> ScriptedIncus.put_status(@web_instance, "Stopped")
+    end)
+
+    ScriptedIncus.event(native, ScriptedIncus.lifecycle(@web_instance, "instance-shutdown"))
+    assert {:ok, %{"StatusCode" => 0}} = Task.await(task)
+    Wait.close(waiter)
+  end
+
   test "removed deletes an auto-remove container after its exit, then answers", %{
     context: context,
     native: native
@@ -278,4 +333,12 @@ defmodule Opsmaru.Containers.Native.WaitTest do
   end
 
   defp deadline, do: System.monotonic_time(:millisecond) + 4_000
+
+  defp messages do
+    receive do
+      message -> [message | messages()]
+    after
+      0 -> []
+    end
+  end
 end

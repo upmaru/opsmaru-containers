@@ -436,6 +436,34 @@ defmodule Opsmaru.Containers.Native.LifecycleTest do
       assert instances(native) == []
     end
 
+    test "a delete Incus refuses as running just after the stop is retried", %{
+      context: context,
+      native: native
+    } do
+      ScriptedIncus.update(native, &%{&1 | delete_refusals: 2})
+      assert {204, ""} = call(context, "DELETE", "/containers/old")
+      assert instances(native) |> Enum.map(& &1["name"]) == ["oc-aaaa11111111"]
+
+      deletes = for {:incus, {:delete_instance, "oc-bbbb22222222"}} <- messages(), do: :delete
+      assert length(deletes) == 3
+    end
+
+    test "a run record read that fails while the instance changes state is retried", %{
+      context: context,
+      native: native
+    } do
+      ScriptedIncus.update(native, &%{&1 | read_failures: 2})
+
+      assert {200, %{"State" => %{"ExitCode" => 3}}} =
+               call(context, "GET", "/containers/old/json")
+
+      # Every attempt fails: the answer names Incus, not a missing record.
+      ScriptedIncus.update(native, &%{&1 | read_failures: 10})
+
+      assert {503, %{"message" => "native engine: Incus is not available"}} =
+               call(context, "GET", "/containers/old/json")
+    end
+
     test "inspect reports the exit record, and 137 when none was written", %{
       context: context,
       native: native
@@ -706,4 +734,12 @@ defmodule Opsmaru.Containers.Native.LifecycleTest do
 
   defp ago(seconds), do: DateTime.utc_now() |> DateTime.add(-seconds) |> DateTime.to_iso8601()
   defp deadline, do: System.monotonic_time(:millisecond) + 4_000
+
+  defp messages do
+    receive do
+      message -> [message | messages()]
+    after
+      0 -> []
+    end
+  end
 end

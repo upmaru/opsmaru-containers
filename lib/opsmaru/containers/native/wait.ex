@@ -8,10 +8,19 @@ defmodule Opsmaru.Containers.Native.Wait do
   alias Opsmaru.Containers.Native.{Container, Lifecycle, RunRecord}
 
   @reread 1_000
+  @settle 2_000
   @running ["Running", "Starting", "Stopping", "Frozen"]
   @not_recorded "native: exit status not recorded"
 
-  defstruct [:native, :container, :condition, :channel, :target_run, seen_running: false]
+  defstruct [
+    :native,
+    :container,
+    :condition,
+    :channel,
+    :target_run,
+    :unrecorded_since,
+    seen_running: false
+  ]
 
   @doc "Docker's wait conditions. An empty condition is `not-running`."
   def condition(nil), do: {:ok, :not_running}
@@ -97,12 +106,33 @@ defmodule Opsmaru.Containers.Native.Wait do
     if done?(waiter, status, record) do
       body = if stale?(waiter, record), do: not_recorded(), else: body(record, waiter)
 
-      case waiter.condition do
-        :removed -> removed(waiter, body, deadline, cancelled?)
-        _ -> {:ok, body}
+      case settled(waiter, body) do
+        {:answer, _} -> answer(waiter, body, deadline, cancelled?)
+        {:wait, waiter} -> next(waiter, deadline, cancelled?)
       end
     else
-      next(waiter, deadline, cancelled?)
+      next(%{waiter | unrecorded_since: nil}, deadline, cancelled?)
+    end
+  end
+
+  defp answer(%{condition: :removed} = waiter, body, deadline, cancelled?),
+    do: removed(waiter, body, deadline, cancelled?)
+
+  defp answer(_, body, _, _), do: {:ok, body}
+
+  # While Incus 7.0.1 starts an OCI instance it reports it as stopped, though
+  # the shim may already have recorded the new run without an exit. A missing
+  # exit status is final only once it has held for `@settle` milliseconds:
+  # the start window is shorter, and a forced stop's missing record is
+  # permanent.
+  defp settled(waiter, body) do
+    now = System.monotonic_time(:millisecond)
+
+    cond do
+      body != not_recorded() -> {:answer, waiter}
+      waiter.unrecorded_since == nil -> {:wait, %{waiter | unrecorded_since: now}}
+      now - waiter.unrecorded_since >= @settle -> {:answer, waiter}
+      true -> {:wait, waiter}
     end
   end
 
@@ -174,7 +204,14 @@ defmodule Opsmaru.Containers.Native.Wait do
     end
   end
 
-  defp ours?(%{"metadata" => %{"source" => source}}, instance) when is_binary(source) do
+  # Only state changes wake the wait. Every file read, including the wait's
+  # own run-record reads, emits `instance-file-retrieved`, which would
+  # otherwise wake it again at once.
+  @actions ~w(instance-started instance-stopped instance-shutdown instance-restarted
+              instance-paused instance-resumed instance-deleted instance-renamed)
+
+  defp ours?(%{"metadata" => %{"source" => source, "action" => action}}, instance)
+       when is_binary(source) and action in @actions do
     source |> String.split("?", parts: 2) |> hd() |> String.ends_with?("/instances/" <> instance)
   end
 

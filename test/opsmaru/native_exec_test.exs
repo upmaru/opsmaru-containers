@@ -237,7 +237,8 @@ defmodule Opsmaru.Containers.Native.ExecTest do
       assert :ok = Stream.shutdown_write(stream, deadline())
       assert drain(stream) == ""
 
-      assert {409, %{"message" => "exec #{id} is not running"}} ==
+      # As dockerd answers once the exec's process has exited.
+      assert {404, %{"message" => "NotFound: process does not exist #{id}: not found"}} ==
                call(context, "POST", "/exec/#{id}/resize?h=40&w=100")
     end
 

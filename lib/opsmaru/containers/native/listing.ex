@@ -9,7 +9,7 @@ defmodule Opsmaru.Containers.Native.Listing do
   # native project has containers, so a listing is never silently partial.
 
   alias Opsmaru.Containers.Docker.EngineRequest
-  alias Opsmaru.Containers.Native.RunRecord
+  alias Opsmaru.Containers.Native.{Lifecycle, RunRecord}
 
   @list_filters ~w(id name label status ancestor exited)
   @prune_filters ~w(until label label!)
@@ -187,7 +187,7 @@ defmodule Opsmaru.Containers.Native.Listing do
 
   defp states(native, containers, deadline) do
     containers
-    |> Task.async_stream(&{&1, RunRecord.read(native, &1, deadline)},
+    |> Task.async_stream(&{&1, Lifecycle.record(native, &1, deadline)},
       max_concurrency: @record_concurrency,
       timeout: max(deadline - System.monotonic_time(:millisecond), 1),
       on_timeout: :kill_task

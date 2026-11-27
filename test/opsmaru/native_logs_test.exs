@@ -179,6 +179,40 @@ defmodule Opsmaru.Containers.Native.LogsTest do
       assert length(opens) == 2
     end
 
+    test "follow closes its session once the run finishes, before the instance stops", %{
+      context: context,
+      native: native
+    } do
+      # A held SFTP session keeps Incus from completing the stop.
+      ScriptedIncus.update(native, fn state ->
+        state
+        |> ScriptedIncus.put_file(@web_instance, @record, run_record(2, nil))
+        |> ScriptedIncus.put_status(@web_instance, "Running")
+      end)
+
+      task = Task.async(fn -> logs(context, "web", "stdout=1&follow=1") end)
+      Process.sleep(350)
+      assert Task.yield(task, 0) == nil
+      assert {:incus, {:sftp_open, @web_instance}} in messages()
+
+      ScriptedIncus.update(native, fn state ->
+        state
+        |> put_log(@web_instance, log(3), file([rec(:stdout, 2, @t + 4_000_000_000, "last\n")]))
+        |> ScriptedIncus.put_file(@web_instance, @record, run_record(2, 0))
+      end)
+
+      Process.sleep(500)
+      assert Task.yield(task, 0) == nil
+      held = messages()
+      assert {:incus, {:sftp_close, @web_instance}} in held
+      refute {:incus, {:sftp_open, @web_instance}} in held
+
+      ScriptedIncus.update(native, &ScriptedIncus.put_status(&1, @web_instance, "Stopped"))
+      conn = Task.await(task)
+
+      assert frames(conn.resp_body) == [{1, "one\n"}, {1, "three\n"}, {1, "last\n"}]
+    end
+
     test "follow on a stopped container answers what is written and ends", %{context: context} do
       conn = logs(context, "web", "stdout=1&follow=1")
       assert frames(conn.resp_body) == [{1, "one\n"}, {1, "three\n"}]
@@ -246,6 +280,44 @@ defmodule Opsmaru.Containers.Native.LogsTest do
         |> ScriptedIncus.put_status(@job_instance, "Stopped")
       end)
 
+      assert frames(drain(stream)) == [{1, "after\n"}]
+    end
+
+    test "closes its session once the awaited run finishes, before the instance stops", %{
+      context: context,
+      native: native
+    } do
+      ScriptedIncus.update(native, fn state ->
+        state
+        |> put_log(@job_instance, log(1), file([rec(:stdout, 1, @t, "before\n")]))
+        |> ScriptedIncus.put_file(@job_instance, @record, run_record(1, nil))
+        |> ScriptedIncus.put_status(@job_instance, "Running")
+      end)
+
+      assert {:upgrade, _, stream, ""} = attach(context, "job", "stream=1&stdout=1")
+
+      ScriptedIncus.update(native, fn state ->
+        state
+        |> put_log(
+          @job_instance,
+          log(1),
+          file([rec(:stdout, 1, @t, "before\n"), rec(:stdout, 1, @t + 1, "after\n")])
+        )
+        |> ScriptedIncus.put_file(@job_instance, @record, run_record(1, 0))
+      end)
+
+      Process.sleep(500)
+
+      # The reading session closed and none opened again while the instance runs.
+      held = messages()
+
+      sessions =
+        for {:incus, {call, @job_instance}} <- held, call in [:sftp_open, :sftp_close], do: call
+
+      assert :sftp_open in sessions
+      assert List.last(sessions) == :sftp_close
+
+      ScriptedIncus.update(native, &ScriptedIncus.put_status(&1, @job_instance, "Stopped"))
       assert frames(drain(stream)) == [{1, "after\n"}]
     end
 

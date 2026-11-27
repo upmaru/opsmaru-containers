@@ -239,31 +239,56 @@ defmodule Opsmaru.Containers.Native.Images do
     )
   end
 
+  # The producer hands chunks to the consumer. The download runs in a reader
+  # process, and opsmaru_incus may call the sink from another process still,
+  # so every message names its sender explicitly: the sink sends its chunk to
+  # the producer and waits for the producer's acknowledgement.
   defp producer(backend, engine, instance, path, deadline) do
     spawn_link(fn ->
-      handoff = fn message ->
-        receive do
-          {:next, consumer} -> send(consumer, {self(), message})
-        after
-          max(deadline - System.monotonic_time(:millisecond), 0) -> exit(:normal)
-        end
-      end
+      producer = self()
 
-      result =
-        backend.stream_file(
-          engine,
-          instance,
-          path,
-          fn bytes ->
-            handoff.({:chunk, bytes})
-            :ok
-          end,
-          deadline
-        )
+      spawn_link(fn ->
+        sink = &handoff(producer, &1, deadline)
+        send(producer, {:result, backend.stream_file(engine, instance, path, sink, deadline)})
+      end)
 
-      handoff.(if result == :ok, do: :done, else: {:error, result})
+      produce(producer, deadline)
     end)
   end
+
+  defp handoff(producer, bytes, deadline) do
+    send(producer, {:chunk, self(), bytes})
+
+    receive do
+      {^producer, :ack} -> :ok
+    after
+      remaining(deadline) -> {:error, :deadline}
+    end
+  end
+
+  defp produce(producer, deadline) do
+    receive do
+      {:next, consumer} ->
+        receive do
+          {:chunk, reader, bytes} ->
+            send(consumer, {producer, {:chunk, bytes}})
+            send(reader, {producer, :ack})
+            produce(producer, deadline)
+
+          {:result, :ok} ->
+            send(consumer, {producer, :done})
+
+          {:result, error} ->
+            send(consumer, {producer, {:error, error}})
+        after
+          remaining(deadline) -> exit(:normal)
+        end
+    after
+      remaining(deadline) -> exit(:normal)
+    end
+  end
+
+  defp remaining(deadline), do: max(deadline - System.monotonic_time(:millisecond), 0)
 
   defp serialized(key, deadline, fun) do
     if :global.set_lock(key, [node()], 0) do

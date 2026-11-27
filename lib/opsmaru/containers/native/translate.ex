@@ -63,7 +63,34 @@ defmodule Opsmaru.Containers.Native.Translate do
          :ok <- refused(refusals(normalised)),
          :ok <- image_given(normalised.top["Image"]),
          {:ok, devices, mounts} <- binds(normalised.host, map_source) do
-      {:ok, Map.merge(normalised, %{binds: devices, mounts: mounts})}
+      host = mapped_host(normalised.host, Enum.map(mounts, & &1["Source"]))
+      {:ok, Map.merge(normalised, %{host: host, binds: devices, mounts: mounts})}
+    end
+  end
+
+  # The stored HostConfig carries the mapped sources, as dockerd stores the
+  # body the nested bind policy rewrote. Binds come first, then Mounts, in the
+  # order `binds/2` mapped them.
+  defp mapped_host(host, []), do: host
+
+  defp mapped_host(host, sources) do
+    {binds, sources} = Enum.split(sources, length(host["Binds"] || []))
+
+    host
+    |> replace_sources("Binds", binds, fn bind, source ->
+      [_ | rest] = String.split(bind, ":")
+      Enum.join([source | rest], ":")
+    end)
+    |> replace_sources("Mounts", sources, &Map.put(&1, "Source", &2))
+  end
+
+  defp replace_sources(host, key, sources, replace) do
+    case host[key] do
+      list when is_list(list) and list != [] ->
+        Map.put(host, key, Enum.zip_with(list, sources, replace))
+
+      _ ->
+        host
     end
   end
 
@@ -498,7 +525,7 @@ defmodule Opsmaru.Containers.Native.Translate do
 
           mount = %{
             "Type" => "bind",
-            "Source" => entry.source,
+            "Source" => mapped,
             "Destination" => entry.target,
             "Mode" => if(entry.readonly, do: "ro", else: ""),
             "RW" => not entry.readonly,
