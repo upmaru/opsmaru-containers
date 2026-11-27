@@ -24,6 +24,29 @@ defmodule Opsmaru.Containers.Native.Backend do
   @callback import_image(Incus.t(), map(), binary(), Enumerable.t(), deadline()) ::
               result(String.t())
   @callback delete_image(Incus.t(), String.t(), deadline()) :: :ok | {:error, term()}
+  @callback create_instance(Incus.t(), map(), deadline()) :: :ok | {:error, term()}
+  @callback instance_state(Incus.t(), String.t(), deadline()) :: result(map())
+  @doc "An Incus state change: `start`, `stop`, `freeze` or `unfreeze`."
+  @callback update_state(Incus.t(), String.t(), String.t(), boolean(), deadline()) ::
+              :ok | {:error, term()}
+  @doc "Merges keys into the instance config. An empty value removes a key."
+  @callback patch_config(Incus.t(), String.t(), map(), deadline()) :: :ok | {:error, term()}
+  @callback head_file(Incus.t(), String.t(), Path.t(), deadline()) :: result(map())
+  @doc "Writes a file (iodata) or creates a directory (`:directory`) owned by root."
+  @callback push_file(
+              Incus.t(),
+              String.t(),
+              Path.t(),
+              iodata() | :directory,
+              integer(),
+              deadline()
+            ) ::
+              :ok | {:error, term()}
+  @doc "Subscribes to the client project's lifecycle events."
+  @callback subscribe(Incus.t(), deadline()) :: result(term())
+  @doc "The next event (`{:ok, map}`), `:timeout`, or an error once the stream is gone."
+  @callback next_event(term(), non_neg_integer()) :: {:ok, map()} | :timeout | {:error, term()}
+  @callback close_events(term()) :: :ok
 end
 
 defmodule Opsmaru.Containers.Native.Incus do
@@ -31,7 +54,18 @@ defmodule Opsmaru.Containers.Native.Incus do
   @behaviour Opsmaru.Containers.Native.Backend
 
   alias Opsmaru.Incus
-  alias Opsmaru.Incus.{Error, Files, Images, Model, Operation, RequestContext, Response, Session}
+
+  alias Opsmaru.Incus.{
+    Error,
+    Events,
+    Files,
+    Images,
+    Model,
+    Operation,
+    RequestContext,
+    Response,
+    Session
+  }
 
   @max_exec_output 1_048_576
 
@@ -163,6 +197,112 @@ defmodule Opsmaru.Containers.Native.Incus do
       |> await(client)
       |> ok()
     end
+  end
+
+  @impl true
+  def create_instance(client, body, deadline) do
+    with {:ok, client} <- scope(client, deadline) do
+      client
+      |> Incus.call("CreateInstance", %{}, body: body)
+      |> await(client)
+      |> ok()
+    end
+  end
+
+  @impl true
+  def instance_state(client, instance, deadline) do
+    with {:ok, client} <- scope(client, deadline) do
+      case Incus.call(client, "GetInstanceState", %{"name" => instance}) do
+        {:ok, %Response{metadata: %Model{data: state}}} -> {:ok, state}
+        {:error, %Error{http_status: 404}} -> {:error, :not_found}
+        {:error, _} = error -> error
+      end
+    end
+  end
+
+  @impl true
+  def update_state(client, instance, action, force, deadline) do
+    body = %{"action" => action, "timeout" => -1, "force" => force, "stateful" => false}
+
+    with {:ok, client} <- scope(client, deadline) do
+      client
+      |> Incus.call("UpdateInstanceState", %{"name" => instance}, body: body)
+      |> await(client)
+      |> ok()
+    end
+  end
+
+  @impl true
+  def patch_config(client, instance, config, deadline) do
+    with {:ok, client} <- scope(client, deadline) do
+      case Incus.call(client, "PatchInstance", %{"name" => instance}, body: %{"config" => config}) do
+        {:ok, _} ->
+          :ok
+
+        {:error, %Error{http_status: 404}} ->
+          {:error, :not_found}
+
+        {:error, %Error{kind: :native, http_status: status}} when status < 500 ->
+          {:error, :rejected}
+
+        {:error, _} ->
+          {:error, :uncertain}
+      end
+    end
+  end
+
+  @impl true
+  def head_file(client, instance, path, deadline) do
+    with {:ok, client} <- scope(client, deadline) do
+      case Files.head(client, instance, path) do
+        {:ok, %{result: metadata}} -> {:ok, metadata}
+        {:error, %Error{http_status: 404}} -> {:error, :not_found}
+        {:error, _} = error -> error
+      end
+    end
+  end
+
+  @impl true
+  def push_file(client, instance, path, content, mode, deadline) do
+    {type, source} =
+      if content == :directory,
+        do: {"directory", []},
+        else: {"file", [IO.iodata_to_binary(content)]}
+
+    with {:ok, client} <- scope(client, deadline) do
+      case Files.create(client, instance, path, source, type: type, mode: mode, uid: 0, gid: 0) do
+        {:ok, _} ->
+          :ok
+
+        {:error, %Error{kind: :native, http_status: status}} when status < 500 ->
+          {:error, :rejected}
+
+        {:error, _} ->
+          {:error, :uncertain}
+      end
+    end
+  end
+
+  @impl true
+  def subscribe(client, deadline) do
+    with {:ok, client} <- scope(client, deadline),
+         do: Events.subscribe(client, types: ["lifecycle"])
+  end
+
+  @impl true
+  def next_event(channel, timeout) do
+    case Events.next(channel, timeout) do
+      {:ok, %Model{data: event}} -> {:ok, event}
+      {:error, %Error{kind: kind}} when kind in [:timeout, :deadline] -> :timeout
+      :eof -> {:error, :closed}
+      {:error, _} = error -> error
+    end
+  end
+
+  @impl true
+  def close_events(channel) do
+    Events.close(channel)
+    :ok
   end
 
   defp scope(client, deadline) do

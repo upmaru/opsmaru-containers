@@ -1,8 +1,9 @@
 defmodule Opsmaru.Containers.Native.RunRecord do
   @moduledoc false
   # The shim's `/.opsmaru/state/run.json`. It is written inside the container,
-  # so its root user can change it: it is read as bounded, untrusted input,
-  # and a record that does not parse is treated as missing.
+  # so its root user can change it: it is read as bounded, untrusted input.
+  # A record that does not parse, or is too large, is `:malformed`, and the
+  # route that needs it answers an error naming the native engine.
 
   @path "/.opsmaru/state/run.json"
   @limit 65_536
@@ -23,16 +24,20 @@ defmodule Opsmaru.Containers.Native.RunRecord do
   def path, do: @path
   def limit, do: @limit
 
-  @doc "Reads a container's run record: `{:ok, record}`, `:missing` or an error."
+  @doc """
+  Reads a container's run record: `{:ok, record | :missing | :malformed}`,
+  or an error when Incus cannot be read.
+  """
   def read(native, container, deadline) do
     case native.backend.read_file(native.client, container.instance, @path, @limit, deadline) do
       {:ok, data} -> {:ok, parse(data)}
       {:error, :not_found} -> {:ok, :missing}
+      {:error, reason} when reason in [:too_large, :not_a_file] -> {:ok, :malformed}
       {:error, _} = error -> error
     end
   end
 
-  @doc "Parses a record, or returns `:missing` for one that is not valid."
+  @doc "Parses a record, or returns `:malformed` for one that is not valid."
   def parse(data) when is_binary(data) do
     with {:ok, %{"version" => 1, "run" => run} = record} <- Jason.decode(data),
          true <- is_integer(run) and run in 1..4_294_967_295,
@@ -54,7 +59,7 @@ defmodule Opsmaru.Containers.Native.RunRecord do
         oom_killed: Map.get(record, "oom_killed", false)
       }
     else
-      _ -> :missing
+      _ -> :malformed
     end
   end
 

@@ -11,6 +11,7 @@ defmodule Opsmaru.Containers.Docker.Routing do
           :nested
           | {:list, [map()]}
           | {:prune, [map()]}
+          | {:native, Opsmaru.Containers.Native.Container.t()}
           | {:error, pos_integer(), String.t()}
 
   @spec route(map(), String.t(), integer()) :: t()
@@ -37,7 +38,7 @@ defmodule Opsmaru.Containers.Docker.Routing do
 
     case Enum.find(containers, &Map.has_key?(&1.execs, exec_id)) do
       nil -> :nested
-      _container -> native(admission.route)
+      _container -> unavailable(admission.route)
     end
   end
 
@@ -57,17 +58,20 @@ defmodule Opsmaru.Containers.Docker.Routing do
       :nested ->
         :nested
 
-      {:native, _container} ->
-        native(admission.route)
+      {:native, container} ->
+        native(admission.route, container)
 
       {:error, _, _} = error ->
         error
     end
   end
 
-  defp native(%{"native" => %{"class" => "refused", "reason" => reason}}),
+  defp native(%{"native" => %{"class" => "refused", "reason" => reason}}, _),
     do: {:error, 501, "native engine: #{reason}"}
 
-  defp native(%{"path" => path}),
+  defp native(%{"native" => %{"class" => "translated"}}, container), do: {:native, container}
+
+  @doc "The answer for a translated route this release does not serve yet."
+  def unavailable(%{"path" => path}),
     do: {:error, 501, "native engine: #{path} is not available in this release"}
 end

@@ -46,10 +46,10 @@ defmodule Opsmaru.Containers.Native.ListingTest do
           %{valid | "signal" => String.duplicate("S", 17)},
           %{valid | "oom_killed" => "yes"}
         ] do
-      assert RunRecord.parse(Jason.encode!(invalid)) == :missing
+      assert RunRecord.parse(Jason.encode!(invalid)) == :malformed
     end
 
-    assert RunRecord.parse("not json") == :missing
+    assert RunRecord.parse("not json") == :malformed
   end
 
   test "until takes RFC 3339 times, Unix seconds and durations" do

@@ -349,6 +349,9 @@ Translation happens before any Incus mutation. A refused field never leaves a ha
 - **Init:** the Docker process is not PID 1 (the spike saw PIDs 12 to 14), so default signal dispositions apply. Under Docker without `--init`, a PID 1 with no SIGTERM handler ignores `docker stop` and is killed after the timeout (exit 137). Natively it exits on SIGTERM (exit 143), as under `docker run --init`.
 - **Hostname files:** the kernel hostname is set, but `/etc/hostname` and `/etc/hosts` are the image's or Incus's, not Docker's generated files.
 - **Image health checks, image volumes and `/dev/shm`:** an image `HEALTHCHECK` is not run, image `VOLUME` paths stay in the root filesystem, and `/dev/shm` is Incus's rather than Docker's 64 MiB tmpfs.
+- **Generated names:** a create without a name gets its instance name (`oc-` and 12 hex characters), not one of Docker's `adjective_surname` names.
+
+**Order of checks.** A native create checks, in order: the body (refused fields, values a translated field cannot honour, a missing `Image`), each bind source through `map_bind_source/2`, the name in both engines, then the image handoff and the shim for the image's architecture. Only then is the instance created and the shim pushed. A failed push deletes the instance. `Opsmaru.Containers.Native.eligibility/1` runs the body checks alone, so a host's `select_engine/2` can route only eligible bodies to native.
 
 ### 13. Lifecycle, wait and auto-remove
 
@@ -366,7 +369,9 @@ Translation happens before any Incus mutation. A refused field never leaves a ha
 
 **Wait.** The library subscribes to Incus lifecycle events for the instance, then reads its state, so a stop between the two is not missed. Once the instance has stopped after the run being waited for, it reads the run record and answers `{"StatusCode": N}`. A missing exit record gives 137, as decision 7 says, with `Error.Message` set. `condition=next-exit`, `not-running` and `removed` follow Docker's meanings.
 
-**Auto-remove.** The library starts no processes, so nothing watches containers in the background. For an `AutoRemove` container, a `wait` with `condition=removed` (which the CLI sends for `--rm`) reads the exit status, deletes the stopped instance, then answers. `Native.reap/2`, which the host calls on its own schedule, deletes stopped `AutoRemove` instances that no wait removed, for example after a client disconnect.
+As dockerd does, the status line and headers are sent before the wait begins, and the result is the only body chunk. An Incus failure after the headers is answered as `{"StatusCode": -1, "Error": {...}}`. The library re-reads the instance on each lifecycle event for it and at least once a second, so a missed event only delays the answer. A wait whose instance ran and stopped without the shim recording the awaited run also answers 137.
+
+**Auto-remove.** The library starts no processes, so nothing watches containers in the background. For an `AutoRemove` container, a `wait` with `condition=removed` (which the CLI sends for `--rm`) reads the exit status, deletes the stopped instance, then answers. `Native.reap/2`, which the host calls on its own schedule, deletes stopped `AutoRemove` instances that no wait removed, for example after a client disconnect. It keeps an instance that has no run record yet, because `docker run --rm` creates, then waits, then starts. A wait checks for a client disconnect immediately before it deletes, so a gone client never causes a removal.
 
 ### 14. Logs and attach
 

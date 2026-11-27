@@ -79,7 +79,7 @@ defmodule Opsmaru.Containers.Native.RoutingTest do
     task = request(context, "GET", "/containers/bbbb/json")
     {head, _} = serve(engine, 404, ~s({"message":"No such container: bbbb"}))
     assert head =~ "GET /v1.57/containers/bbbb/json HTTP/1.1"
-    assert {501, _} = await(task)
+    assert {200, %{"Id" => @new, "Name" => "/new"}} = await(task)
 
     # Both engines match by prefix.
     task = request(context, "GET", "/containers/bbbb/json")

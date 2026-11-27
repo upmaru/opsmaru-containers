@@ -273,9 +273,10 @@ Events never carry:
 
 ## Route containers to the native engine
 
-The native engine is in development: a create the host routes to it is
-refused with a 501 until container creation lands. The host contract below is
-in place and checked.
+The native engine is in development. Create, start, stop, kill, restart,
+pause, unpause, rename, remove, inspect and wait are served for native
+containers. Logs, attach and exec answer a 501 naming the native engine until
+they land. The host contract below is in place and checked.
 
 - **Target:** build `Opsmaru.Containers.Native.Target.new/2` from a client
   for the native project and the shim binaries (see
@@ -284,7 +285,14 @@ in place and checked.
   the engine's project and share its Incus owner and identity. Build the
   capabilities snapshot with that same target.
 - **Choice:** implement the optional `select_engine/2` callback. Without it,
-  every container stays nested and no Incus call is made for routing.
+  every container stays nested and no Incus call is made for routing. A body
+  the native engine cannot honour is refused with a 400 naming each field,
+  never sent to nested instead. Call `Opsmaru.Containers.Native.eligibility/1`
+  on the decoded body to choose native only when it can run there.
+- **Binds:** native bind sources go through `map_bind_source/2`, then become
+  Incus disk devices of the native instance. Return the source path as the
+  native project's Incus server sees it. Without the callback, native creates
+  with binds are refused.
 - **Routing:** with a native target, each container and exec route lists the
   native project once to find the engine that owns the reference. Container
   listing and prune cover both engines.
@@ -296,6 +304,12 @@ in place and checked.
   native project once per image ID. The engine image needs `skopeo` and
   `umoci`. Call `Opsmaru.Containers.Native.prune_images/2` on your own
   schedule to remove copies that no instance uses.
+- **Auto-remove:** `docker run --rm` removes its container when the CLI's
+  wait answers. A client that disconnects first leaves the stopped instance.
+  Call `Opsmaru.Containers.Native.reap/2` on your own schedule to delete
+  those.
+- **Wait and stop deadlines:** native wait, stop and restart run within the
+  Plug's `:stream_timeout`, as relayed requests do.
 
 ## Scope
 

@@ -12,6 +12,13 @@ defmodule Opsmaru.Containers.TestSupport.ScriptedIncus do
     * `:images` - image maps, as `GetImages` returns them
     * `:exec` - `fn instance, command -> result end`
     * `:import` - `fn properties, metadata, rootfs_bytes -> result end`
+    * `:on_state` - `fn instance, action, state -> state end`, run after a
+      state change is applied, so a test can play the shim (write a run
+      record, stop the instance)
+    * `:events` - queued lifecycle events, delivered in order by `next_event/2`
+    * `:on_subscribe` - `fn state -> state end`, run when a subscription
+      starts, so a test can change the instance between subscribe and read
+    * `:image_files` - paths every created instance's image holds
   """
 
   @behaviour Opsmaru.Containers.Native.Backend
@@ -21,7 +28,17 @@ defmodule Opsmaru.Containers.TestSupport.ScriptedIncus do
 
   @doc "A scripted client for `project`, reporting calls to `observer`."
   def client(project, state, observer \\ self()) do
-    defaults = %{instances: [], files: %{}, images: [], exec: nil, import: nil}
+    defaults = %{
+      instances: [],
+      files: %{},
+      images: [],
+      exec: nil,
+      import: nil,
+      on_state: fn _, _, state -> state end,
+      on_subscribe: & &1,
+      events: [],
+      image_files: []
+    }
 
     {:ok, agent} =
       Agent.start(fn -> Map.merge(defaults, Map.new(state)) |> Map.put(:observer, observer) end)
@@ -123,6 +140,151 @@ defmodule Opsmaru.Containers.TestSupport.ScriptedIncus do
 
     :ok
   end
+
+  @doc "Queue a lifecycle event for subscribers."
+  def event(target, event), do: update(target, &%{&1 | events: &1.events ++ [event]})
+
+  @doc "A lifecycle event for an instance."
+  def lifecycle(instance, action),
+    do: %{
+      "type" => "lifecycle",
+      "metadata" => %{"action" => action, "source" => "/1.0/instances/" <> instance}
+    }
+
+  @impl true
+  def create_instance(client, body, _deadline) do
+    report(client, {:create_instance, body})
+
+    Agent.get_and_update(client.server, fn state ->
+      if Enum.any?(state.instances, &(&1["name"] == body["name"])) do
+        {{:error, :conflict}, state}
+      else
+        config = Map.put(body["config"], "volatile.base_image", body["source"]["fingerprint"])
+
+        instance = %{
+          "name" => body["name"],
+          "status" => "Stopped",
+          "config" => config,
+          "devices" => body["devices"]
+        }
+
+        {:ok, %{state | instances: state.instances ++ [instance]}}
+      end
+    end)
+  end
+
+  @impl true
+  def instance_state(client, instance, _deadline) do
+    report(client, {:instance_state, instance})
+
+    case Enum.find(get(client, :instances), &(&1["name"] == instance)) do
+      nil ->
+        {:error, :not_found}
+
+      found ->
+        {:ok, Map.merge(%{"status" => found["status"], "network" => %{}}, found["state"] || %{})}
+    end
+  end
+
+  @impl true
+  def update_state(client, instance, action, force, _deadline) do
+    report(client, {:update_state, instance, action, force})
+
+    status = %{
+      "start" => "Running",
+      "stop" => "Stopped",
+      "freeze" => "Frozen",
+      "unfreeze" => "Running"
+    }
+
+    Agent.update(client.server, fn state ->
+      state = put_status(state, instance, status[action])
+      state.on_state.(instance, action, state)
+    end)
+  end
+
+  @doc "Set an instance's status in a state map."
+  def put_status(state, instance, status) do
+    put_instance(state, instance, &%{&1 | "status" => status})
+  end
+
+  @doc "Write a file in a state map."
+  def put_file(state, instance, path, content),
+    do: %{state | files: Map.put(state.files, {instance, path}, content)}
+
+  @doc "Change one instance in a state map."
+  def put_instance(state, instance, fun) do
+    instances =
+      Enum.map(state.instances, fn
+        %{"name" => ^instance} = found -> fun.(found)
+        other -> other
+      end)
+
+    %{state | instances: instances}
+  end
+
+  @impl true
+  def patch_config(client, instance, config, _deadline) do
+    report(client, {:patch_config, instance, config})
+
+    update(client, fn state ->
+      instances =
+        Enum.map(state.instances, fn
+          %{"name" => ^instance} = found ->
+            merged = Map.merge(found["config"], config)
+            %{found | "config" => for({k, v} <- merged, v != "", into: %{}, do: {k, v})}
+
+          other ->
+            other
+        end)
+
+      %{state | instances: instances}
+    end)
+  end
+
+  @impl true
+  def head_file(client, instance, path, _deadline) do
+    report(client, {:head_file, instance, path})
+
+    if Map.has_key?(get(client, :files), {instance, path}) or path in get(client, :image_files),
+      do: {:ok, %{type: "file"}},
+      else: {:error, :not_found}
+  end
+
+  @impl true
+  def push_file(client, instance, path, content, mode, _deadline) do
+    content = if content == :directory, do: :directory, else: IO.iodata_to_binary(content)
+    report(client, {:push_file, instance, path, mode, content})
+    update(client, &%{&1 | files: Map.put(&1.files, {instance, path}, content)})
+  end
+
+  @impl true
+  def subscribe(client, _deadline) do
+    report(client, :subscribe)
+    Agent.update(client.server, fn state -> state.on_subscribe.(state) end)
+    {:ok, client.server}
+  end
+
+  @impl true
+  def next_event(agent, timeout) do
+    case Agent.get_and_update(agent, fn
+           %{events: [event | rest]} = state -> {{:ok, event}, %{state | events: rest}}
+           state -> {:none, state}
+         end) do
+      {:ok, event} ->
+        {:ok, event}
+
+      :none when timeout <= 0 ->
+        :timeout
+
+      :none ->
+        Process.sleep(min(timeout, 10))
+        next_event(agent, timeout - 10)
+    end
+  end
+
+  @impl true
+  def close_events(_agent), do: :ok
 
   defp get(%Incus{server: agent}, key), do: Agent.get(agent, &Map.fetch!(&1, key))
 

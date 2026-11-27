@@ -106,6 +106,10 @@ defmodule Opsmaru.Containers.Native.Listing do
       {_, :missing} ->
         %{state: "created", status: "Created", exit_code: 0, started_at: nil, finished_at: nil}
 
+      # The list keeps serving other containers; inspect names the fault.
+      {_, :malformed} ->
+        %{state: "dead", status: "Dead", exit_code: 0, started_at: nil, finished_at: nil}
+
       {_, %RunRecord{} = record} ->
         # A forced stop leaves no exit code: Docker's convention is 137.
         code = record.exit_code || 137

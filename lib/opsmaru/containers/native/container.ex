@@ -34,6 +34,9 @@ defmodule Opsmaru.Containers.Native.Container do
   @doc "The key every native container instance carries."
   def role_key, do: @role
 
+  @doc "The instance config key holding the Docker name."
+  def name_key, do: @prefix <> "name"
+
   @doc "The instance config key holding one exec record."
   def exec_key(exec_id), do: @exec_prefix <> exec_id
 

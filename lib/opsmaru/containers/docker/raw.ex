@@ -57,7 +57,7 @@ defmodule Opsmaru.Containers.Docker.Raw do
     with {:ok, admission} <- Admission.admit(host, request, admission_deadline),
          :ok <- admit_exchange(exchange, request, admission),
          {:ok, protocol, framing} <- handshake(request, admission.route),
-         :nested <- Routing.route(admission, request.query, admission_deadline),
+         :nested <- raw_route(admission, request.query, admission_deadline),
          {:ok, backend} <- dial(admission.context, deadline) do
       Exchange.sent(exchange, Exchange.dialed_outcome(request.method))
 
@@ -68,6 +68,16 @@ defmodule Opsmaru.Containers.Docker.Raw do
 
       {:error, status, message, reason} ->
         refuse(exchange, status, message, reason)
+    end
+  end
+
+  # Native attach is served in a later task: every other answer that is not
+  # nested is refused here, with no Incus mutation.
+  defp raw_route(admission, query, deadline) do
+    case Routing.route(admission, query, deadline) do
+      :nested -> :nested
+      {:error, _, _} = error -> error
+      _ -> Routing.unavailable(admission.route)
     end
   end
 

@@ -103,6 +103,7 @@
     {"topic": "Hostname files", "difference": "The kernel hostname is set, but /etc/hostname and /etc/hosts are the image's or Incus's, not Docker's generated files."},
     {"topic": "Image health checks", "difference": "A HEALTHCHECK in the image config is not run, so inspect shows no Health state."},
     {"topic": "Image volumes", "difference": "VOLUME paths in the image config stay in the container's root filesystem. No anonymous volumes are created."},
-    {"topic": "Shared memory", "difference": "/dev/shm is the one Incus provides, not Docker's 64 MiB tmpfs."}
+    {"topic": "Shared memory", "difference": "/dev/shm is the one Incus provides, not Docker's 64 MiB tmpfs."},
+    {"topic": "Generated names", "difference": "A create without a name gets its instance name (oc- and the first 12 hex characters of its ID), not one of Docker's generated adjective_surname names."}
   ]
 }

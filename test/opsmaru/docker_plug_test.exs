@@ -323,10 +323,10 @@ defmodule Opsmaru.Containers.Docker.PlugTest do
     refute_received :dialed
   end
 
-  test "a create the host routes to native is refused without reaching nested" do
+  test "a create the host routes to native without a native target is refused, not relayed" do
     body = ~s({"Image":"demo","Labels":{"engine":"native"}})
 
-    assert {501, %{"message" => "native engine is not available in this release"}} =
+    assert {501, %{"message" => "native engine: the target has no native project"}} =
              response(select("/containers/create", engine([]), body))
 
     assert_received {:selected, request}
