@@ -321,6 +321,43 @@ defmodule Opsmaru.Containers.Native.LogsTest do
       assert frames(drain(stream)) == [{1, "after\n"}]
     end
 
+    test "a run recorded right after a stale stopped read does not end the attach", %{
+      context: context,
+      native: native
+    } do
+      ScriptedIncus.update(native, fn state ->
+        state
+        |> put_log(@job_instance, log(1), file([rec(:stdout, 1, @t, "old run\n")]))
+        |> ScriptedIncus.put_file(@job_instance, @record, run_record(1, 0))
+      end)
+
+      assert {:upgrade, _, stream, ""} = attach(context, "job", "stream=1&stdout=1")
+
+      # The start is in flight and reads as stopped; the run starts, prints
+      # and exits right after that read.
+      ScriptedIncus.update(native, fn state ->
+        %{
+          state
+          | after_state: fn state ->
+              %{state | after_state: & &1}
+              |> put_log(
+                @job_instance,
+                log(1),
+                file([rec(:stdout, 1, @t, "old run\n"), rec(:stdout, 2, @t + 1, "hello\n")])
+              )
+              |> ScriptedIncus.put_file(@job_instance, @record, run_record(2, 0))
+              |> ScriptedIncus.put_status(@job_instance, "Running")
+            end
+        }
+      end)
+
+      refute until_end(stream, now() + 500) == :eof
+
+      ScriptedIncus.update(native, &ScriptedIncus.put_status(&1, @job_instance, "Stopped"))
+      early = for {:early, bytes} <- messages(), into: "", do: bytes
+      assert frames(early <> drain(stream)) == [{1, "hello\n"}]
+    end
+
     test "refuses stdin, logs and a request without stream", %{context: context} do
       for {query, refused} <- [
             {"stream=1&stdin=1&stdout=1", "stdin attach"},
@@ -401,6 +438,21 @@ defmodule Opsmaru.Containers.Native.LogsTest do
       body: ""
     }
   end
+
+  # Reads until the stream ends or the deadline passes, keeping what it read
+  # for a later `drain/1`, and returns how it stopped.
+  defp until_end(stream, deadline) do
+    case Stream.recv(stream, 65_536, deadline) do
+      {:ok, bytes} ->
+        send(self(), {:early, bytes})
+        until_end(stream, deadline)
+
+      other ->
+        other
+    end
+  end
+
+  defp now, do: System.monotonic_time(:millisecond)
 
   defp drain(stream, acc \\ "") do
     case Stream.recv(stream, 65_536, deadline()) do

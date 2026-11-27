@@ -12,7 +12,7 @@ Task 7 of [add-native-oci-engine](../openspec/changes/add-native-oci-engine/task
 - **Dependency patch:** `opsmaru_incus` 0.2.10 was patched locally to open an exec session's `control` websocket first (see findings). Without it, the image handoff failed every time. Native containers need an `opsmaru_incus` release with that fix before they ship.
 - Raw logs, reports and telemetry are kept in the consumer's ignored spike directory.
 
-**Verdict:** the differential passed 21 of 21 runs (7 cases, 3 runs each) on the final code, with native timings close to nested. The native-only checks below passed. Reaching that took fixes for the real-Incus findings below. Fixes in the library's own modules have fixture tests that fail without them. Fixes inside `Native.Incus`, the adapter over `opsmaru_incus`, are exercised only against real Incus, as before.
+**Verdict:** on the final code, the differential passed 21 of 21 runs (7 cases, 3 runs each), plus 24 more runs of the two foreground cases, with native timings close to nested. The native-only checks below passed. Reaching that took fixes for the real-Incus findings below. Fixes in the library's own modules have fixture tests that fail without them. Fixes inside `Native.Incus`, the adapter over `opsmaru_incus`, are exercised only against real Incus, as before.
 
 ## Differential
 
@@ -43,6 +43,7 @@ These ran against the native socket alone, after the differential, on the final 
 - **`start -a`** on a command that printed a line and exited 4: the line, then exit 4. `docker wait` then answered 4.
 - **Prune** with a run-label filter removed both stopped containers.
 - **TTY exec:** the console size reached the container (`stty size` gave `40 100`), and a window change during the exec reached it too (`30 90`), as on nested. When the exec ended before the CLI's resize, dockerd answered 404 (`NotFound: process does not exist …`) and native answered 409. Native now gives dockerd's answer, confirmed against real Incus.
+- **DNS:** `--dns` and `--dns-search` (two of each) gave the same nameservers and search line in `/etc/resolv.conf` as nested, apart from Docker's comment lines.
 - **Refusals,** each a Docker-shaped error naming the native engine: `docker cp`, `stats`, `top`, `export`, `diff` and `update` (501), `run -i` (400 naming `AttachStdin, OpenStdin, StdinOnce`) and `run -p` (400 naming `HostConfig.PortBindings`).
 
 ## Ledger
@@ -61,7 +62,7 @@ Real Incus 7.0.1 behaved differently from the scripted backend in these ways. Ea
 - **A held SFTP session holds up a stop.** `docker stop` with `logs -f` open took 60 s, and a foreground run's attach held one for about 31 s, until Incus gave up on the session. The follower and the attach now read the run record over their own session on every poll, close it once the followed run has finished, wait for the stop holding none, then read to the end with a new session. That brought both cases within a second of nested.
 - **Stop state flaps.** While an OCI instance stopped, `GetInstance` and `GetInstanceState` both alternated between Running and Stopped, and `GetInstanceState` answered 500 `Invalid PID -1` for about 700 ms. `volatile.last_state.power` stays `RUNNING` until the stop hook finishes, together with the `instance-shutdown` event. The library reads a Stopped status with that key still `RUNNING`, and the 500, as Stopping.
 - **Delete right after a stop.** `DeleteInstance` answered 400 `Instance is running` briefly after the status read Stopped. That refusal is retried within the deadline.
-- **Start reads Stopped.** While a start was in flight, the instance read Stopped though the shim had already recorded the new run. A wait treats a missing exit status as final only once it has held for 2 s.
+- **Start reads Stopped.** While a start was in flight, the instance read Stopped though the shim had already recorded the new run. A wait treats a missing exit status as final only once it has held for 2 s. In the last confirmation run, 1 of 21 differential runs showed a further race: a named foreground `docker run` returned, and inspect still said `running`. The wait had read the stale Stopped, then a record that the quick run had finished in between. Waits and attaches now read the state again after the record.
 - **File reads fail around state changes.** The files API answered 500 (the fork helper's socket reset) while an instance started or stopped, and a failed read could take seconds. Run record reads are retried up to five times.
 - **Event volume.** Every file read emits an `instance-file-retrieved` lifecycle event, including the wait's own reads. Waits wake only on state-change actions.
 - **Conditional patches.** `opsmaru_incus` sends `PatchInstance` only with an ETag, so the library reads the instance first and retries a 412.

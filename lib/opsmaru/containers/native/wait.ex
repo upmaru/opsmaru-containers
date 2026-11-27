@@ -46,7 +46,7 @@ defmodule Opsmaru.Containers.Native.Wait do
           channel: channel
         }
 
-        case observe(waiter, deadline) do
+        case observe_for_target(waiter, deadline) do
           {:ok, status, record} ->
             {:ok,
              %{
@@ -217,9 +217,24 @@ defmodule Opsmaru.Containers.Native.Wait do
 
   defp ours?(_, _), do: false
 
-  defp observe(waiter, deadline) do
+  # Choosing the target reads the state first: a run the state shows in
+  # progress is then named by the record read after it.
+  defp observe_for_target(waiter, deadline) do
     with {:ok, state} <- Lifecycle.instance_state(waiter.native, waiter.container, deadline),
          {:ok, record} <- Lifecycle.record(waiter.native, waiter.container, deadline) do
+      {:ok, state["status"], record}
+    end
+  end
+
+  # Deciding that the awaited run has exited reads the record first. While a start is in flight, Incus
+  # 7.0.1 reports the instance as stopped, and a short run can start, exit
+  # and be recorded in that window: a state read before the record could
+  # pair that stale stop with the finished run. Once the shim has recorded
+  # an exit, Incus reports the instance as running or stopping until its
+  # stop completes, so a state read after the record cannot.
+  defp observe(waiter, deadline) do
+    with {:ok, record} <- Lifecycle.record(waiter.native, waiter.container, deadline),
+         {:ok, state} <- Lifecycle.instance_state(waiter.native, waiter.container, deadline) do
       {:ok, state["status"], record}
     end
   end

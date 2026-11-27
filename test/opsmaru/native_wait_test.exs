@@ -118,6 +118,36 @@ defmodule Opsmaru.Containers.Native.WaitTest do
     Wait.close(waiter)
   end
 
+  test "a run that starts and exits between the state and record reads is not yet an exit", %{
+    context: context,
+    native: native
+  } do
+    # While the start is in flight Incus reports the instance stopped, and a
+    # short run can be recorded right after that read.
+    {:ok, waiter} = Wait.begin(context, container(native, @job), :next_exit, deadline())
+    assert waiter.target_run == 1
+
+    ScriptedIncus.update(native, fn state ->
+      %{
+        state
+        | after_state: fn state ->
+            %{state | after_state: & &1}
+            |> ScriptedIncus.put_file(@job_instance, @record, record(1, 0))
+            |> ScriptedIncus.put_status(@job_instance, "Running")
+          end
+      }
+    end)
+
+    task = Task.async(fn -> Wait.run(waiter, deadline(), fn -> false end) end)
+    Process.sleep(300)
+    assert Task.yield(task, 0) == nil
+
+    ScriptedIncus.update(native, &ScriptedIncus.put_status(&1, @job_instance, "Stopped"))
+    ScriptedIncus.event(native, ScriptedIncus.lifecycle(@job_instance, "instance-shutdown"))
+    assert {:ok, %{"StatusCode" => 0}} = Task.await(task)
+    Wait.close(waiter)
+  end
+
   test "file retrieval events do not wake the wait", %{context: context, native: native} do
     # Every file read, the wait's own included, emits instance-file-retrieved.
     {:ok, waiter} = Wait.begin(context, container(native, @web), :next_exit, deadline())

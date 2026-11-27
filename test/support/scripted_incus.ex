@@ -28,6 +28,8 @@ defmodule Opsmaru.Containers.TestSupport.ScriptedIncus do
       as it does just after an OCI instance stops
     * `:read_failures` - how many file reads fail first, as they do while an
       instance starts or stops
+    * `:after_state` - `fn state -> state end`, run after each instance state
+      read, so a test can change the instance between that read and the next
   """
 
   @behaviour Opsmaru.Containers.Native.Backend
@@ -50,7 +52,8 @@ defmodule Opsmaru.Containers.TestSupport.ScriptedIncus do
       session: fn _, _ -> %{output: [], exit: 0} end,
       operations: %{},
       delete_refusals: 0,
-      read_failures: 0
+      read_failures: 0,
+      after_state: & &1
     }
 
     {:ok, agent} =
@@ -220,13 +223,18 @@ defmodule Opsmaru.Containers.TestSupport.ScriptedIncus do
   def instance_state(client, instance, _deadline) do
     report(client, {:instance_state, instance})
 
-    case Enum.find(get(client, :instances), &(&1["name"] == instance)) do
-      nil ->
-        {:error, :not_found}
+    result =
+      case Enum.find(get(client, :instances), &(&1["name"] == instance)) do
+        nil ->
+          {:error, :not_found}
 
-      found ->
-        {:ok, Map.merge(%{"status" => found["status"], "network" => %{}}, found["state"] || %{})}
-    end
+        found ->
+          {:ok,
+           Map.merge(%{"status" => found["status"], "network" => %{}}, found["state"] || %{})}
+      end
+
+    Agent.update(client.server, fn state -> state.after_state.(state) end)
+    result
   end
 
   @impl true

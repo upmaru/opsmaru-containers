@@ -462,19 +462,23 @@ defmodule Opsmaru.Containers.Native.Logs do
   defp stopped(pipe, follower, position) do
     %{native: native, container: container, deadline: deadline} = follower
 
-    case Lifecycle.record(native, container, deadline) do
-      {:ok, %RunRecord{run: run}} when run >= follower.target ->
-        case reopen(native, container, deadline) do
-          {:ok, session} ->
-            read(native, session, position, :ok, &push(pipe, follower, &1, &2))
-            close(native, session)
+    # The stop seen before this record could be the start's stale one (see
+    # `Native.Wait`), so the state is read again after the record.
+    with {:ok, %RunRecord{run: run}} when run >= follower.target <-
+           Lifecycle.record(native, container, deadline),
+         {:ok, %{"status" => status}} when status not in @running <-
+           Lifecycle.instance_state(native, container, deadline) do
+      case reopen(native, container, deadline) do
+        {:ok, session} ->
+          read(native, session, position, :ok, &push(pipe, follower, &1, &2))
+          close(native, session)
 
-          _ ->
-            :ok
-        end
+        _ ->
+          :ok
+      end
 
-        Pipe.finish(pipe, :eof)
-
+      Pipe.finish(pipe, :eof)
+    else
       _ ->
         Process.sleep(@attach_poll)
         attached(pipe, follower, position, nil)
