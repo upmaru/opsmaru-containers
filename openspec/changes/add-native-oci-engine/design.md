@@ -39,7 +39,9 @@ The library supplies the container's entrypoint: a small static **init shim**, b
 - It records the exit status.
 - It writes stdout and stderr as separate, timestamped log records that survive restarts.
 
-Incus still provides the container, its lifecycle, limits, network, freeze and exec. The library reads what the shim wrote through `opsmaru_incus`'s files API and SFTP session, which reads files at an offset. A second spike (task 2) qualifies the shim before any translation work.
+Incus still provides the container, its lifecycle, limits, network, freeze and exec. The library reads what the shim wrote through `opsmaru_incus`'s files API and SFTP session, which reads files at an offset.
+
+The second spike (task 2, 2026-11-27) qualified the shim against the same Incus 7.0.1 runtime and passed both gates. See the [spike report](../../../docs/native-oci-spike.md). Its findings are folded into decisions 6, 8, 9, 13 and 14 below.
 
 ## Goals / Non-Goals
 
@@ -201,6 +203,8 @@ While the child runs, the shim:
 - serves `kill` and `stop` requests on the control socket;
 - on SIGTERM from Incus (a graceful `incus stop`), sends the spec's `stop_signal` to the child.
 
+A graceful `incus stop` is not Docker's stop. The spike showed that Incus sends SIGTERM to every process in the container, not only to the entrypoint. A child that traps both signals saw SIGTERM from Incus and the stop signal from the shim. Docker's stop therefore always goes through `init stop` (decision 13). An administrator's `incus stop` behaves as Incus documents it.
+
 When the child exits, the shim drains the pipes, writes the exit record, and exits. Incus then stops the instance, as it does when any entrypoint exits.
 
 ### 7. Run records and exit status
@@ -235,7 +239,13 @@ The shim writes stdout and stderr to numbered files `/.opsmaru/logs/0000000001.l
 
 Records split output at newlines and at 16 KiB. Bytes with no newline are flushed as a partial record after 100 ms or at exit. Records from both streams go into one file in the order the shim read them, so their relative order is kept.
 
-**Reading.** The library reads records through an `opsmaru_incus` SFTP session on the instance: list `/.opsmaru/logs`, then positioned reads from a file and offset. A reader's position is the pair (file number, offset), so rotation never invalidates it. A position older than the oldest kept file continues from the oldest. That is the record loss rotation implies, as in Docker's own drivers.
+**Reading.** The library reads records through an `opsmaru_incus` SFTP session on the instance: list `/.opsmaru/logs`, then positioned reads from a file and offset. A reader's position is the pair (file number, offset), so rotation never invalidates it. A position older than the oldest kept file continues from the oldest. That is the record loss rotation implies, as in Docker's own drivers. The spike saw it once, with a 64 KiB × 3 rotation and a 160 KB burst against a 250 ms poll.
+
+SFTP sessions follow three rules the spike established:
+
+- **A session ends when the instance stops under it.** The next request fails with a deadline or channel error. The reader opens a new session, retrying every 200 ms while the instance is stopping. That took about 86–300 ms in the spike.
+- **A session on a stopped instance holds up its start.** A start made while one was open did not return until the session closed (about 55 s, when the probe was killed). Reads of a stopped instance therefore open a session, read, and close it. The library never keeps a session on a stopped instance, and it closes its own sessions on an instance before starting it.
+- **SFTP works on stopped and frozen instances.** A 100 MiB log read at about 32 MiB/s.
 
 **Driver.** `HostConfig.LogConfig.Type` must be empty, `json-file`, `local` or `none`. The first three use the shim's files, with Docker's `max-size` and `max-file` options translated. Without options, the host's configured default applies, and the library's default is 20 MiB × 5, as Docker's `local` driver. `none` discards output, and `docker logs` then gets Docker's own "configured logging driver does not support reading" error. Other drivers are refused.
 
@@ -247,13 +257,15 @@ Records split output at newlines and at 16 KiB. Bytes with no newline are flushe
 /.opsmaru/init exec --user U --cwd D -- ARGV...
 ```
 
-The command array passes through the exec API exactly. The environment goes in the Incus exec `environment` field: the container's env, then the exec's `Env`, plus `OPSMARU_EXEC_ENV` naming those variables. In `exec` mode the shim:
+The command array passes through the exec API exactly. Only the exec's own `Env` goes in the Incus exec `environment` field, plus `OPSMARU_EXEC_ENV` (a JSON array of its names, in order) and `OPSMARU_EXEC_UNSET` (names that a Docker `Env` entry without `=` removes). The container's environment is already in the spec. In `exec` mode the shim:
 
-1. removes every variable Incus added that is not named in `OPSMARU_EXEC_ENV`;
-2. applies Docker's defaults;
-3. resolves `U` from the container's passwd and group files;
-4. changes to `D` (default: the container's working directory);
+1. takes only the variables named in `OPSMARU_EXEC_ENV`. That drops the ones Incus adds itself, which the spike listed: `HOME`, `LANG`, `PATH`, `TERM`, `USER`, `container` and `CREDENTIALS_DIRECTORY`;
+2. builds the environment as for the main process (decision 5): Docker's base, then the spec's `env`, then the exec's variables, then `HOME`;
+3. resolves `U` (default: the spec's user) from the container's passwd and group files, with the spec's `group_add`;
+4. changes to `D` (default: the spec's working directory);
 5. `execve`s. No shim process stays behind, so the exit code and TTY are the command's own.
+
+The library adds `TERM=xterm` for a TTY exec when the exec does not set it, as dockerd does.
 
 Docker's exec user defaults to the container's user. Exec channels are as the spike qualified:
 
@@ -331,7 +343,7 @@ Translation happens before any Incus mutation. A refused field never leaves a ha
 
 **Recorded differences.** These are documented, and the differential cases normalise them:
 
-- **Init:** the Docker process is PID 5, not PID 1, so default signal dispositions apply. Under Docker without `--init`, a PID 1 with no SIGTERM handler ignores `docker stop` and is killed after the timeout (exit 137). Natively it exits on SIGTERM (exit 143), as under `docker run --init`.
+- **Init:** the Docker process is not PID 1 (the spike saw PIDs 12 to 14), so default signal dispositions apply. Under Docker without `--init`, a PID 1 with no SIGTERM handler ignores `docker stop` and is killed after the timeout (exit 137). Natively it exits on SIGTERM (exit 143), as under `docker run --init`.
 - **Hostname files:** the kernel hostname is set, but `/etc/hostname` and `/etc/hosts` are the image's or Incus's, not Docker's generated files.
 - **OOMKilled:** recorded only if task 2.7 confirms the cgroup counter.
 
@@ -339,8 +351,8 @@ Translation happens before any Incus mutation. A refused field never leaves a ha
 
 | Route | Native behaviour |
 | --- | --- |
-| `POST /containers/{id}/start` | Incus state `start`. Then read the new run record until it shows the child started or failed, within the deadline. A failed `execve` is answered as dockerd answers it (400 with the exec error), and the container is left exited with 127 or 126 |
-| `POST /containers/{id}/stop?t=&signal=` | through exec, `init stop T` with the signal. The shim sends it, waits up to `T`, sends SIGKILL, records the exit and exits. The library waits for the instance to stop, with an Incus forced stop as a backstop at `T` + 10 s. A paused container is unfrozen first |
+| `POST /containers/{id}/start` | close the library's SFTP sessions on the instance (decision 8), then Incus state `start` (about 0.25–0.3 s in the spike). Then read the new run record until it shows the child started or failed, within the deadline. A failed `execve` is answered as dockerd answers it (400 with the exec error), and the container is left exited with 127 or 126. A missing working directory is reported with runc's wording and 127 |
+| `POST /containers/{id}/stop?t=&signal=` | through exec, `init stop T` with the signal. The shim sends it, waits up to `T`, sends SIGKILL, records the exit and exits. The library waits for the instance to stop, with an Incus forced stop as a backstop at `T` + 10 s. A paused container is unfrozen first, because Incus refuses exec into a frozen instance (`Instance is frozen`) |
 | `POST /containers/{id}/kill?signal=` | through exec, `init kill SIGNAL`. The default SIGKILL kills the child, and the shim records 137. If the exec fails, SIGKILL falls back to an Incus forced stop and no record (decision 7) |
 | `POST /containers/{id}/restart?t=` | stop then start, with the same rules |
 | `POST /containers/{id}/pause`, `unpause` | Incus `freeze` and `unfreeze` |
@@ -361,10 +373,16 @@ Translation happens before any Incus mutation. A refused field never leaves a ha
 - `timestamps` prefixes each record's time in RFC 3339 with nanoseconds.
 - `since` and `until` filter by record time.
 - `tail` counts records from the end, as Docker's drivers do.
-- `follow` polls the SFTP position every 250 ms while the instance runs. After the instance stops, it reads to the end once more, so output written just before exit is delivered, then ends.
+- `follow` polls the SFTP position every 250 ms while the instance runs. After the instance stops, it opens a new session and reads to the end once more, so output written just before exit is delivered, then ends. In the spike, a 250 ms poll delivered records within about 600 ms of being written. All 300 lines written in the instant before exit arrived through the session reopened after the stop.
 - `details` is refused, because native containers carry no log attributes.
 
-**Attach.** `POST /containers/{id}/attach` with `stream=1`, output only and no stdin is what `docker run` without `-d` or `-i` sends, before it starts the container. It is served from the log records of the next run, from its first record. So nothing written between start and the attach reading is lost. Stdin attach is refused (non-goal).
+**Attach.** `POST /containers/{id}/attach` with `stream=1`, output only and no stdin is what `docker run` without `-d` or `-i` sends, before it starts the container. It is served from the log records of the next run, from its first record. So nothing written between start and the attach reading is lost:
+
+1. On attach, the library notes the end of the logs as the position, and closes that SFTP session.
+2. When the start has returned, it reopens a session, retrying while a short-lived process is already stopping, and follows from the position.
+3. It answers once that run's exit record exists and the instance has stopped.
+
+The spike ran this three times with a command that printed two lines and exited at once. Both lines arrived every time, and the attach ended 0.3–0.6 s after the start returned. Stdin attach is refused (non-goal).
 
 ### 15. Route table and evidence
 
@@ -396,3 +414,4 @@ Evidence for a native route needs:
 
 - **2026-11-27, first design:** argv in `oci.entrypoint`, exit status from Incus, logs from the console log. The first spike failed its exit-status gate and showed that the other two would not work either. See the [spike report](../../../docs/native-oci-spike.md).
 - **2026-11-27, this design:** the init shim, with image handoff fixed to candidate B. Gated on the second spike (task 2).
+- **2026-11-27, second spike:** passed. Exact argv and exit status (the gates), logs, signals, process setup, push and the foreground run all qualified. The design was updated for SFTP session rules, Incus's graceful stop and the exec environment. linux/amd64 was not run.

@@ -27,14 +27,19 @@ Recorded in `docs/native-oci-spike.md`.
 
 Tasks 2.1 and 2.2 are library code with unit tests. Tasks 2.3 to 2.10 run with explicit opt-in against an isolated Incus 7.0.1 project with `instance_oci`, using images from the pinned nested engine and the shim built by task 2.2. Record each result in `docs/native-oci-spike.md` under a second-spike section. **Tasks 2.3 and 2.4 are gates:** if either fails, this change returns to planning. Tasks 3 to 7 start only after tasks 2.3 to 2.10 are recorded.
 
-- [ ] 2.1 Write the shim in `priv/native_init/` (Go, standard library only):
+**Result (2026-11-27): both gates pass.** Every item qualified except linux/amd64, which had no host. The design is updated for what the spike found. Tasks 3 to 7 may start.
+
+- [x] 2.1 Write the shim in `priv/native_init/` (Go, standard library only):
   - init mode: spec parsing, run records, child start with `execve` detection, log records and rotation, signal forwarding, subreaper, the control socket;
   - the `exec`, `kill` and `stop` modes.
 
   Add unit tests for the spec, run record and log record formats, rotation, partial-record flushing and `execve` failure codes.
-- [ ] 2.2 Add the README with the formats, the build recipe and digests. Add `scripts/check_init.sh` and `mise run check:init` (vet, test, two clean builds per architecture, digest comparison), and add them to `mise run check`.
-- [ ] 2.3 **Gate: exact argv.** Push the shim and a spec into a created OCI container, as the design does. Verify that argv containing `$ \ | [ * ~ '`, spaces, quotes, an empty string, a newline and non-UTF-8 bytes arrives unchanged.
-- [ ] 2.4 **Gate: exit status.** Read the run record through the files API and SFTP after the instance stops, for:
+  - Done: `priv/native_init/`, Go standard library only. Tests also cover exact argv, `kill` and `stop` through the control socket, OOM detection, exec-mode environment filtering, and the drain limit when a descendant holds a pipe. They pass with `-race`.
+- [x] 2.2 Add the README with the formats, the build recipe and digests. Add `scripts/check_init.sh` and `mise run check:init` (vet, test, two clean builds per architecture, digest comparison), and add them to `mise run check`.
+  - Done. The check also fails when the README's digests don't match the build. The Hex consumer check now requires the shim's source and rejects any built file under `priv/native_init`.
+- [x] 2.3 **Gate: exact argv.** Push the shim and a spec into a created OCI container, as the design does. Verify that argv containing `$ \ | [ * ~ '`, spaces, quotes, an empty string, a newline and non-ASCII UTF-8 arrives unchanged. Docker's API and the spec are JSON, so argv is always valid UTF-8.
+  - **Pass.** 14 arguments, including `$HOME`, `x\y`, `*`, an empty string, an embedded newline, quotes, `$(id)`, a backtick form, `a;b&&c` and `héllo ✓`, reached `printf` byte for byte, with `printf` found through `PATH`.
+- [x] 2.4 **Gate: exit status.** Read the run record through the files API and SFTP after the instance stops, for:
   - exits 0 and 3;
   - a child killed by `init kill KILL` (137) and by `init kill TERM` (143);
   - `init stop` with a child that ignores SIGTERM (137 after the timeout);
@@ -42,23 +47,42 @@ Tasks 2.1 and 2.2 are library code with unit tests. Tasks 2.3 to 2.10 run with e
   - a forced Incus stop (no record).
 
   Record the time from exit to a readable record and to the `instance-shutdown` event.
-- [ ] 2.5 Logs:
+  - **Pass.** Every case recorded the expected code, readable through the files API and SFTP after stop: 0, 3, 137, 143, 4 (a trapped HUP), 137 after a 2 s stop timeout, 5 (the spec's SIGQUIT), 127, 126, and 128 for an unknown user. A forced stop left a record without `finished_at`. Exit to `Stopped` took about 0.8 s, and the record was readable by then. The event stream was not used, because of the consumer's gateway fault.
+- [x] 2.5 Logs:
   - stream separation and relative order under interleaved writes;
   - timestamps, partial records, and persistence across a restart;
   - rotation at a small `max_size`;
   - a 250 ms SFTP follow while running, and that the last records written before exit are readable after stop;
   - SFTP on a stopped and on a frozen instance;
   - the read throughput of a 100 MiB log through SFTP.
-- [ ] 2.6 Signals and stop: a graceful `incus stop` reaching the child as the spec's `stop_signal`; `init kill` with HUP to a trapping child; `init stop` on a frozen container after unfreeze; the forced-stop backstop.
-- [ ] 2.7 Process setup:
+  - **Pass.**
+    - Per-stream order is kept and times are monotonic. Partial records are flagged. Logs persist across nine restarts with run numbers. Rotation keeps the newest files.
+    - Follow delivered records within about 600 ms at a 250 ms poll, including 300 lines written just before exit.
+    - SFTP works on stopped and frozen instances. 100 MiB was written in 1.2 s and read in 3.3 s.
+    - **New:** an SFTP session ends when the instance stops, and one held on a stopped instance holds up its start. Both are now in design decision 8.
+- [x] 2.6 Signals and stop: a graceful `incus stop` reaching the child as the spec's `stop_signal`; `init kill` with HUP to a trapping child; `init stop` on a frozen container after unfreeze; the forced-stop backstop.
+  - **Pass with a finding:** a graceful `incus stop` sends SIGTERM to every process in the container, so Docker stop must use `init stop`. Exec into a frozen instance fails at once (`Instance is frozen`), and works after unfreeze. A forced stop leaves no exit record, as the 137 rule expects.
+- [x] 2.7 Process setup:
   - user and group names from `/etc/passwd` and `/etc/group`, supplementary groups and `group_add`;
   - `cwd`, and `sethostname`;
   - the main process's environment, and Docker's `HOME`, `PATH` and `HOSTNAME` defaults;
   - in `exec` mode, which variables Incus adds and that `OPSMARU_EXEC_ENV` removes them;
   - whether the cgroup's `memory.events` `oom_kill` count is readable in the container and increases on an out-of-memory kill.
-- [ ] 2.8 Push: time and bytes to push the shim and spec per create; an image that already contains `/.opsmaru`; a bind target under `/.opsmaru`; the shim on linux/arm64 and linux/amd64 if an amd64 host is available, otherwise recorded as not run.
-- [ ] 2.9 Foreground run: the `docker run` sequence (attach, start, wait) served from log records and run records, with a command that prints and exits within 10 ms of start.
-- [ ] 2.10 Record the verdicts. Update the design where a result differs from what it assumes.
+  - **Pass.**
+    - `daemon` resolved to uid 2, gid 2, groups 1, 4, 10 and 1234 (through `group_add`), with `HOME=/sbin`. `daemon:nogroup` and `4242:4243` (`HOME=/`) also resolved.
+    - Hostname and cwd were set. The environment came out in Docker's order.
+    - In `exec` mode, Incus's own variables were dropped and `DROP` was unset. The user and cwd defaults, exit codes, stdin EOF and TTY all worked through the shim.
+    - A non-root process cannot read `/.opsmaru`.
+    - `oom_kill` is readable in the container, and an OOM kill of a child set `oom_killed`, as Docker reports any OOM kill in the container.
+- [x] 2.8 Push: time and bytes to push the shim and spec per create; an image that already contains `/.opsmaru`; a bind target under `/.opsmaru`; the shim on linux/arm64 and linux/amd64 if an amd64 host is available, otherwise recorded as not run.
+  - **Pass for arm64.**
+    - Create took 0.55–0.6 s. Pushing the 3.0 MB shim and the spec took 0.27–0.42 s through the CLI (three requests).
+    - `GET /files?path=/.opsmaru` is 404 on a fresh instance and a listing when the path exists, so the collision check works. A bind target under `/.opsmaru` is library validation and needs no Incus test.
+    - **linux/amd64 not run:** no amd64 host was available.
+- [x] 2.9 Foreground run: the `docker run` sequence (attach, start, wait) served from log records and run records, with a command that prints and exits within 10 ms of start.
+  - **Pass**, three runs. The attach noted its position, closed its session, then reopened after the start returned (0.27–0.31 s). Both lines and exit code 4 were delivered 0.3–0.6 s after the start returned.
+- [x] 2.10 Record the verdicts. Update the design where a result differs from what it assumes.
+  - Recorded in the spike report. The design is updated in decisions 6, 8, 9, 12, 13 and 14 and in its planning history.
 
 ## 3. Route table and host contract
 

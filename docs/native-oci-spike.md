@@ -30,3 +30,30 @@ Together these support a packaged init shim. The library would push it into each
 **Other observations**
 - On a ZFS pool with `volume.zfs.reserve_space=true`, each native container reserves its full root size (2 GiB by default) up front. About a dozen probe containers exhausted a 29.5 GiB pool, and creates then failed (`size is greater than available space`). A native project needs a small root size or a different pool policy.
 - The consumer's gateway (Macus) intermittently refused the trusted client (`403 unauthorized` after 1–2 s instead of a 3–8 ms answer). It closed an events stream as `revoked`. Afterwards it stopped relaying `operation` events while lifecycle and logging events still arrived, so CLI creates hung even though they had succeeded. A server restart restored it once, and it degraded again. That is a consumer issue, reported there. The spike worked around it by polling operations through the API.
+
+# Second spike: the init shim (task 2)
+
+Task 2 of the change, run on 2026-11-27 with explicit opt-in, against the same isolated runtime and the cached `alpine` OCI image. Each probe container had a 256 MiB root and the shim as its entrypoint. Log reads went through `opsmaru_incus` 0.2.10's SFTP client, the library's own path. Other reads went through the files API.
+
+- **Shim:** linux/arm64, built by the README recipe. The gates and logs ran on `817ab1d1…`. The final build, `30d1d3ab…`, differs only in how a missing working directory is reported, and was confirmed with exact argv, that case, exit 3 and `kill HUP`.
+- **Raw logs and probe scripts:** kept in the consumer's ignored spike directory.
+
+**Verdict:** both gates pass, and every item qualified on arm64. linux/amd64 was not run, because no amd64 host was available.
+
+| Item | Verdict | Finding |
+| --- | --- | --- |
+| 2.3 Exact argv (**gate**) | **Pass** | Arguments containing `$HOME`, `x\y`, `*`, an empty string, an embedded newline, single and double quotes, `$(id)`, a backtick form, `a;b&&c` and `héllo ✓` reached `printf` byte for byte. `printf` was found through the child's `PATH`. Docker's API and the spec are JSON, so argv is always valid UTF-8. |
+| 2.4 Exit status (**gate**) | **Pass** | The run record gave 0; 3; 137 for a self-SIGKILL and for `init kill KILL`; 143 for `init kill TERM`; 4 for a trapped HUP; 137 for `init stop --timeout 2` on a child ignoring SIGTERM (about 2.4 s); and 5 for the spec's `stop_signal` SIGQUIT. Failed starts gave 127 (missing command or cwd), 126 (not executable) and 128 (unknown user), each with Docker's message. A forced Incus stop left a record without `finished_at`. Exit to `Stopped` took about 0.8 s, and the record was readable by then. |
+| 2.5 Logs | Pass | Streams are separate, per-stream order is kept, and times are monotonic. Partial records are flagged. Records carry run numbers across nine restarts. Rotation keeps the newest files. A 250 ms SFTP follow delivered records within about 600 ms. With a 64 KiB × 3 rotation, a 160 KB burst outran it once, which is the loss rotation implies. All 300 lines written in the instant before exit arrived, read after the stop. SFTP works on stopped and frozen instances. 100 MiB was written in 1.2 s and read through SFTP in 3.3 s (about 32 MiB/s). |
+| 2.6 Signals and stop | Pass, with a finding | `init kill` and `init stop` behave as designed. **A graceful `incus stop` sends SIGTERM to every process**, not only the entrypoint: a child trapping both signals ran its TERM handler and then the shim's QUIT. Exec into a frozen instance fails at once with `Instance is frozen` and works after unfreeze. |
+| 2.7 Process setup | Pass | **User:** `daemon` → uid 2, gid 2, groups 1, 4, 10 and 1234 (with `group_add: ["wheel", "1234"]`), `HOME=/sbin`. `daemon:nogroup` → gid 65533. `4242:4243` → `HOME=/`. **Hostname, cwd and environment:** set, with the environment in Docker's order. **Exec mode:** raw Incus exec adds `HOME`, `LANG`, `PATH`, `TERM`, `USER`, `container` and `CREDENTIALS_DIRECTORY`. Through the shim, only the named variables appeared, `DROP` was removed, and the container's user and cwd were the defaults. Exit codes, stdin EOF and a TTY all worked. **Permissions:** a non-root process cannot read `/.opsmaru`. **OOM:** `memory.events` `oom_kill` is readable inside the container. With `limits.memory=64MiB`, a child's OOM kill set `oom_killed: true`, while the main process exited 0. Docker also reports any OOM kill in the container. |
+| 2.8 Push | Pass (arm64) | Create took 0.55–0.6 s. Pushing the 3.0 MB shim and the spec took 0.27–0.42 s with the CLI's three requests. `GET /files?path=/.opsmaru` is 404 on a fresh instance and a listing when the path exists, so the collision check works. |
+| 2.9 Foreground run | Pass | Three times, a reader noted its log position, closed its session, then started the container: a start of 0.27–0.31 s, a command that printed two lines and exited 4. The reader then reopened a session (retrying once while the container was stopping) and delivered both lines and exit code 4, 0.3–0.6 s after the start returned. |
+
+**SFTP session rules** (new, now in design decision 8)
+- A session ends when its instance stops, and the next request fails with a deadline or channel error. A new session opens about 86–300 ms later, once the stop completes.
+- **A session held on a stopped instance holds up that instance's start.** A start made while the probe's session was open returned only after about 55 s, when the probe was killed. With the session closed first, starts took 0.27–0.31 s. The library must close its sessions on an instance before starting it, and must never keep one on a stopped instance.
+
+**Other observations**
+- The Docker process ran as PID 12 to 14, not PID 1, so native containers behave as with `--init`. That is recorded as a difference.
+- The probes saw no 403s or hung requests from the consumer's gateway during this run. They didn't rely on event streams, which were affected in the first spike: stops were observed by polling instance state, and creates and state changes used `incus query --wait`.

@@ -33,6 +33,7 @@ So this change puts a small library-supplied init shim in each native container 
   - The first, recorded, qualified Incus itself.
   - The second qualifies the shim: exact argv, exit status, log capture and follow, signals, process setup and push.
   - If the shim cannot carry exact argv or record exit status, the change returns to planning.
+  - **The second spike passed (2026-11-27).** Both gates and every other item qualified on arm64; amd64 was not run. Implementation (tasks 3 to 7) may start.
 
 Not in this change:
 
