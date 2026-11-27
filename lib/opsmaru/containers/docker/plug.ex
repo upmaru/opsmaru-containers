@@ -12,7 +12,17 @@ if Code.ensure_loaded?(Plug.Conn) do
     """
 
     @behaviour Plug
-    alias Opsmaru.Containers.Docker.{Admission, BindPolicy, EngineSelection, Exchange, HTTP}
+    alias Opsmaru.Containers.Docker.{
+      Admission,
+      BindPolicy,
+      EngineRequest,
+      EngineSelection,
+      Exchange,
+      HTTP,
+      Routing
+    }
+
+    alias Opsmaru.Containers.Native.Listing
     alias Opsmaru.Containers.Transport
     alias Opsmaru.Containers.Transport.Stream
 
@@ -87,14 +97,96 @@ if Code.ensure_loaded?(Plug.Conn) do
 
       with {:ok, admission} <- Admission.admit(options.host, request, deadline),
            _ <- Exchange.admit_route(current_exchange(), admission.route, conn.request_path),
-           :ok <- regular_request(conn, admission.route),
-           {:ok, conn, body, framing} <-
-             prepare_body(conn, options.host, request, admission, deadline) do
-        relay(conn, admission, body, framing, now() + options.stream)
+           :ok <- regular_request(conn, admission.route) do
+        case Routing.route(admission, conn.query_string, deadline) do
+          :nested ->
+            nested(conn, options, request, admission, deadline)
+
+          {:list, containers} ->
+            native_list(conn, admission, containers, now() + options.stream)
+
+          {:prune, containers} ->
+            native_prune(conn, admission, containers, now() + options.stream)
+
+          {:error, status, message} ->
+            refuse(conn, status, message)
+        end
       else
-        {:error, status, message} ->
-          error(conn, status, message, Exchange.refusal_reason(status, message))
+        {:error, status, message} -> refuse(conn, status, message)
       end
+    end
+
+    defp refuse(conn, status, message),
+      do: error(conn, status, message, Exchange.refusal_reason(status, message))
+
+    defp nested(conn, options, request, admission, deadline) do
+      case prepare_body(conn, options.host, request, admission, deadline) do
+        {:ok, conn, body, framing} ->
+          relay(conn, admission, body, framing, now() + options.stream)
+
+        {:error, status, message} ->
+          refuse(conn, status, message)
+      end
+    end
+
+    # The nested engine answers first, so its own validation and errors reach
+    # the client unchanged. Native entries are merged into its answer.
+    defp native_list(conn, admission, containers, deadline) do
+      target = append_query(admission.path, conn.query_string)
+
+      with {:ok, query} <- Listing.list_query(conn.query_string),
+           {:ok, 200, nested} when is_list(nested) <- engine(admission, "GET", target, deadline),
+           {:ok, native} <-
+             Listing.entries(admission.context, containers, query, admission.maximum, deadline) do
+        json(conn, admission, 200, Listing.merge(nested, native, query))
+      else
+        {:ok, status, body} -> json(conn, admission, status, body)
+        {:error, status, message} -> refuse(conn, status, message)
+        {:error, :engine} -> error(conn, 502, "Docker engine connection failed", :upstream_failed)
+      end
+    end
+
+    defp native_prune(conn, admission, containers, deadline) do
+      target = append_query(admission.path, conn.query_string)
+
+      with {:ok, filters} <- Listing.prune_query(conn.query_string),
+           {:ok, 200, %{} = nested} <- engine(admission, "POST", target, deadline),
+           {:ok, deleted} <- Listing.prune(admission.context, containers, filters, deadline) do
+        body = %{
+          "ContainersDeleted" => (nested["ContainersDeleted"] || []) ++ deleted,
+          "SpaceReclaimed" => nested["SpaceReclaimed"] || 0
+        }
+
+        json(conn, admission, 200, body)
+      else
+        {:ok, status, body} -> json(conn, admission, status, body)
+        {:error, status, message} -> refuse(conn, status, message)
+        {:error, :engine} -> error(conn, 502, "Docker engine connection failed", :upstream_failed)
+      end
+    end
+
+    defp engine(admission, method, target, deadline) do
+      Exchange.sent(current_exchange(), Exchange.dialed_outcome(method))
+      body = if method == "POST", do: "", else: nil
+
+      case EngineRequest.json(admission.context, method, target, body, deadline) do
+        {:ok, _, _} = result -> result
+        {:error, _} -> {:error, :engine}
+      end
+    end
+
+    defp json(conn, admission, status, body) do
+      Exchange.sent(current_exchange(), :sent)
+      Exchange.commit(current_exchange(), status)
+      encoded = Jason.encode!(body)
+      Exchange.response_bytes(current_exchange(), byte_size(encoded))
+
+      conn =
+        conn
+        |> Plug.Conn.put_resp_content_type("application/json", nil)
+        |> Plug.Conn.put_resp_header("api-version", admission.maximum)
+
+      write_response(fn -> Plug.Conn.send_resp(conn, status, encoded) end)
     end
 
     defp regular_request(conn, route) do

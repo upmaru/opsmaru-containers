@@ -271,6 +271,32 @@ Events never carry:
 - error messages;
 - a path admission refused.
 
+## Route containers to the native engine
+
+The native engine is in development: a create the host routes to it is
+refused with a 501 until container creation lands. The host contract below is
+in place and checked.
+
+- **Target:** build `Opsmaru.Containers.Native.Target.new/2` from a client
+  for the native project and the shim binaries (see
+  [`priv/native_init/README.md`](../priv/native_init/README.md)), and put it
+  in the nested target's `native` field. The native project must differ from
+  the engine's project and share its Incus owner and identity. Build the
+  capabilities snapshot with that same target.
+- **Choice:** implement the optional `select_engine/2` callback. Without it,
+  every container stays nested and no Incus call is made for routing.
+- **Routing:** with a native target, each container and exec route lists the
+  native project once to find the engine that owns the reference. Container
+  listing and prune cover both engines.
+- **Serialize creates and renames:** names are unique across engines. Each
+  engine checks the other before it creates or renames, so serialize
+  container creates and renames per target, as you serialize engine lifecycle
+  calls. Two hosts sharing a target need the same serialization.
+- **Images:** a native container's image is copied from dockerd into the
+  native project once per image ID. The engine image needs `skopeo` and
+  `umoci`. Call `Opsmaru.Containers.Native.prune_images/2` on your own
+  schedule to remove copies that no instance uses.
+
 ## Scope
 
 The reference tracks Docker Engine and CLI 29.10.0, Buildx 0.39.1 with the

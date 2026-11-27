@@ -33,6 +33,7 @@ defmodule Opsmaru.Containers.Docker.Admission do
          context: context,
          minimum: Version.format(minimum),
          maximum: Version.format(maximum),
+         decoded_path: decoded_path,
          path: upstream_path(request.path, path, version, maximum, context)
        }}
     end

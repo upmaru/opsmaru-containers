@@ -38,11 +38,12 @@ defmodule Opsmaru.Containers.Native.Target do
     do: raise("priv/native_init/README.md must list one digest per architecture")
 
   @enforce_keys [:client, :init]
-  defstruct [:client, :init]
+  # `backend` is the module making Incus calls. Tests replace it.
+  defstruct [:client, :init, backend: Opsmaru.Containers.Native.Incus]
 
   @type architecture :: String.t()
   @type shim :: %{path: Path.t(), sha256: String.t()}
-  @type t :: %__MODULE__{client: Incus.t(), init: %{architecture() => shim()}}
+  @type t :: %__MODULE__{client: Incus.t(), init: %{architecture() => shim()}, backend: module()}
 
   @doc """
   Verifies the shim binaries and returns the target.
@@ -124,14 +125,15 @@ defmodule Opsmaru.Containers.Native.Target do
             connection: %Connection{owner: owner, project: project},
             context: %Context{owner: owner, identity: identity}
           },
-          init: init
+          init: init,
+          backend: backend
         },
         %Incus{
           connection: %Connection{owner: owner, project: nested_project},
           context: %Context{identity: identity}
         }
       )
-      when is_map(init) and map_size(init) > 0 do
+      when is_map(init) and map_size(init) > 0 and is_atom(backend) and not is_nil(backend) do
     is_binary(project) and project != "" and project != nested_project and
       Enum.all?(init, &verified?/1)
   end

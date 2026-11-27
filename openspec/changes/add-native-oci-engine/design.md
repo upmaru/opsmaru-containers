@@ -291,7 +291,7 @@ A native container is an Incus instance in the host-specified native project. Th
 
 ### 11. Per-container routing and listing
 
-Container-scoped routes carry a container reference: a full ID, a unique ID prefix or a name. Admission resolves it in both engines: one list of the native project with recursion (filtered on the role key), and the nested engine's own lookup.
+Container-scoped routes carry a container reference: a full ID, a unique ID prefix or a name. After admission, both adapters resolve it with one list of the native project (filtered on the role key), in Docker's order: full ID, then name, then unique ID prefix. A native full ID or name is final, because IDs are random and names are unique across engines. Only a native prefix match asks the nested engine, where an exact match wins.
 
 - Exactly one match routes to its engine.
 - No match gets dockerd's `404 No such container`.
@@ -301,7 +301,10 @@ Exec IDs route the same way: a native exec ID is an exec record on the container
 
 `GET /containers/json` merges the nested response with translated native entries, applying `all`, `limit`, `size` and the filters `id`, `name`, `label`, `status`, `ancestor` and `exited`. Native status and exit codes come from run records. Any other filter is refused with a Docker-shaped 400 while the native project has containers, so filtering is never silently partial. `POST /containers/prune` prunes both engines and sums the results.
 
-**Name uniqueness across engines.** A create with a name checks both engines before creating. The host serializes container creates per target, as it serializes engine lifecycle mutations. So the check and the create cannot interleave with another create from the same host. A nested create also checks the native project first.
+- **Nested answers first,** so it validates the query as dockerd does, and its errors reach the client unchanged. With no native containers, the request is relayed as before.
+- **Listing differences:** native entries carry no `SizeRw` or `SizeRootFs`, and `ancestor` values are resolved to image IDs in the nested engine without matching descendant images. Prune's `SpaceReclaimed` counts only the nested engine.
+
+**Name uniqueness across engines.** A create with a name checks both engines before creating. The host serializes container creates per target, as it serializes engine lifecycle mutations. So the check and the create cannot interleave with another create from the same host. A nested create, and a nested rename, also checks the native project first, with dockerd's own conflict message. A native name is checked against the nested engine by exact name, not by reference lookup, which would also match ID prefixes.
 
 ### 12. A checked translation table for create
 

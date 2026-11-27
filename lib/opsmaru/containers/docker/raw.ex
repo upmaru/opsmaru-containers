@@ -27,7 +27,7 @@ defmodule Opsmaru.Containers.Docker.Raw do
   reads it back from there.
   """
 
-  alias Opsmaru.Containers.Docker.{Admission, Exchange, HTTP, RawTunnel}
+  alias Opsmaru.Containers.Docker.{Admission, Exchange, HTTP, RawTunnel, Routing}
   alias Opsmaru.Containers.Transport
   alias Opsmaru.Containers.Transport.Stream
 
@@ -57,6 +57,7 @@ defmodule Opsmaru.Containers.Docker.Raw do
     with {:ok, admission} <- Admission.admit(host, request, admission_deadline),
          :ok <- admit_exchange(exchange, request, admission),
          {:ok, protocol, framing} <- handshake(request, admission.route),
+         :nested <- Routing.route(admission, request.query, admission_deadline),
          {:ok, backend} <- dial(admission.context, deadline) do
       Exchange.sent(exchange, Exchange.dialed_outcome(request.method))
 
