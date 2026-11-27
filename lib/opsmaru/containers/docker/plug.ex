@@ -12,7 +12,7 @@ if Code.ensure_loaded?(Plug.Conn) do
     """
 
     @behaviour Plug
-    alias Opsmaru.Containers.Docker.{Admission, BindPolicy, Exchange, HTTP}
+    alias Opsmaru.Containers.Docker.{Admission, BindPolicy, EngineSelection, Exchange, HTTP}
     alias Opsmaru.Containers.Transport
     alias Opsmaru.Containers.Transport.Stream
 
@@ -88,7 +88,8 @@ if Code.ensure_loaded?(Plug.Conn) do
       with {:ok, admission} <- Admission.admit(options.host, request, deadline),
            _ <- Exchange.admit_route(current_exchange(), admission.route, conn.request_path),
            :ok <- regular_request(conn, admission.route),
-           {:ok, conn, body, framing} <- prepare_body(conn, options.host, admission, deadline) do
+           {:ok, conn, body, framing} <-
+             prepare_body(conn, options.host, request, admission, deadline) do
         relay(conn, admission, body, framing, now() + options.stream)
       else
         {:error, status, message} ->
@@ -106,22 +107,33 @@ if Code.ensure_loaded?(Plug.Conn) do
       end
     end
 
-    defp prepare_body(conn, host, %{route: %{"path" => path}} = admission, deadline)
+    defp prepare_body(conn, host, request, %{route: %{"path" => path}} = admission, deadline)
          when path in @guarded_paths do
       with {:ok, bytes, conn} <- read_checked_body(conn),
            _ <- Exchange.request_bytes(current_exchange(), byte_size(bytes)),
            :ok <- detached_exec(path, bytes),
+           :ok <- nested_engine(path, host, request, admission, bytes, deadline),
            {:ok, bytes} <- BindPolicy.apply(host, admission, bytes, deadline) do
         {:ok, conn, bytes, {:length, byte_size(bytes)}}
       end
     end
 
-    defp prepare_body(conn, _, _, _) do
+    defp prepare_body(conn, _, _, _, _) do
       case request_framing(conn) do
         {:error, _, _} = failure -> failure
         framing -> {:ok, conn, :stream, framing}
       end
     end
+
+    # A create the host routes to native is never sent to nested instead.
+    defp nested_engine("/containers/create", host, request, admission, bytes, deadline) do
+      case EngineSelection.select(host, request, admission, bytes, deadline) do
+        :nested -> :ok
+        :native -> {:error, 501, "native engine is not available in this release"}
+      end
+    end
+
+    defp nested_engine(_, _, _, _, _, _), do: :ok
 
     defp detached_exec("/exec/{name:.*}/start", bytes) do
       case Jason.decode(bytes, objects: :ordered_objects) do

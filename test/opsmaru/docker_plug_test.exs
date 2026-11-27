@@ -36,6 +36,32 @@ defmodule Opsmaru.Containers.Docker.PlugTest do
     def map_bind_source(_context, _), do: :deny
   end
 
+  defmodule SelectingPolicy do
+    @moduledoc false
+    @behaviour Host
+
+    # The peer carries the test process, which observes each selection.
+    @impl Host
+    def context(%{host_peer: {context, _observer}}), do: {:ok, context}
+
+    @impl Host
+    def authorize(_, _), do: :allow
+
+    @impl Host
+    def select_engine(_context, %{body: %{"Labels" => %{"engine" => choice}}} = request) do
+      {_, observer} = request.host_peer
+      send(observer, {:selected, request})
+
+      case choice do
+        "native" -> :native
+        "raise" -> raise "private selection error"
+        "late" -> Process.sleep(2_000) && :native
+        "other" -> :docker
+        _ -> :nested
+      end
+    end
+  end
+
   defmodule ScriptedEngine do
     @moduledoc false
     @behaviour Transport
@@ -297,6 +323,44 @@ defmodule Opsmaru.Containers.Docker.PlugTest do
     refute_received :dialed
   end
 
+  test "a create the host routes to native is refused without reaching nested" do
+    body = ~s({"Image":"demo","Labels":{"engine":"native"}})
+
+    assert {501, %{"message" => "native engine is not available in this release"}} =
+             response(select("/containers/create", engine([]), body))
+
+    assert_received {:selected, request}
+    assert request.method == "POST"
+    assert request.route["path"] == "/containers/create"
+    assert request.body == %{"Image" => "demo", "Labels" => %{"engine" => "native"}}
+    refute_received :dialed
+  end
+
+  test "a nested, failing, late or unknown selection keeps the create in nested" do
+    success = fixed_response(201, "{}")
+
+    for choice <- ["nested", "raise", "late", "other"] do
+      body = ~s({"Image":"demo","Labels":{"engine":"#{choice}"}})
+      context = engine({:after_write, body, success})
+      options = [stream_timeout: 2_000, admission_timeout: 200]
+
+      assert {201, %{}} = response(select("/containers/create", context, body, options))
+      assert_received {:selected, _}
+      assert_received {:wire, wire}
+      assert body_of(wire) == body
+    end
+  end
+
+  test "selection runs only for container creates with a JSON object body" do
+    context = engine([])
+
+    assert {400, %{"message" => _}} =
+             response(select("/containers/create", context, ~s(["not an object"])))
+
+    refute_received {:selected, _}
+    refute_received :dialed
+  end
+
   test "an upstream disconnect after a mutation attempt is reported without replay" do
     body = ~s({"Image":"fixture"})
     conn = call("POST", "/containers/create", engine({:after_write, body, []}), body)
@@ -496,6 +560,13 @@ defmodule Opsmaru.Containers.Docker.PlugTest do
     |> Test.conn(path, body)
     |> Conn.put_private(:opsmaru_containers_peer, {context, decision})
     |> Plug.call(Plug.init(Keyword.put(options, :host, Policy)))
+  end
+
+  defp select(path, context, body, options \\ []) do
+    "POST"
+    |> Test.conn(path, body)
+    |> Conn.put_private(:opsmaru_containers_peer, {context, self()})
+    |> Plug.call(Plug.init(Keyword.put(options, :host, SelectingPolicy)))
   end
 
   defp engine(response, minimum \\ "1.40", maximum \\ "1.57") do

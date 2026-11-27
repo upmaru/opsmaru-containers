@@ -86,10 +86,14 @@ Tasks 2.1 and 2.2 are library code with unit tests. Tasks 2.3 to 2.10 run with e
 
 ## 3. Route table and host contract
 
-- [ ] 3.1 Add the optional `select_engine/2` callback with the shared deadline. Default to `nested`. Verify that hosts without it behave exactly as before (the full existing suite).
-- [ ] 3.2 Add the native project and `native_init` binaries to the context target. Validate them apart from the nested engine's project, including the shim digest check and per-architecture lookup.
-- [ ] 3.3 Add the `native` field (`translated` or `refused`, with a reason) to every container-scoped route in `priv/docker/routes.json`, and extend the reference check to require it.
-- [ ] 3.4 Generate `priv/docker/native-create.json` from the pinned API description, with one class per field, a reason for each `ignored` or `refused`, and the recorded differences. Add the check that fails on a missing field.
+- [x] 3.1 Add the optional `select_engine/2` callback with the shared deadline. Default to `nested`. Verify that hosts without it behave exactly as before (the full existing suite).
+  - Result: `Docker.EngineSelection` runs it in `Docker.Plug` for `POST /containers/create`, after the body is read and before bind mapping. Hosts without the callback skip it, and the body is not decoded. A non-object body, a raise, a late answer or any value other than `:native` selects `nested`. Until task 5, a native choice gets a 501 and is never sent to nested. New Plug tests cover each case, and the existing suite passes unchanged.
+- [x] 3.2 Add the native project and `native_init` binaries to the context target. Validate them apart from the nested engine's project, including the shim digest check and per-architecture lookup.
+  - Result: `Native.Target.new/2` takes the native project's client and `%{"aarch64" => path, "x86_64" => path}`. It reads each file once and refuses unknown digests, unknown architectures, relative paths and unreadable files. The digests are compiled from the README table. `Nested.Target` gains an optional `native` field. Context validation requires the same owner and identity, a different non-empty project, and recorded digests that match the table. `Native.Target.shim/2` accepts Docker and Incus architecture names.
+- [x] 3.3 Add the `native` field (`translated` or `refused`, with a reason) to every container-scoped route in `priv/docker/routes.json`, and extend the reference check to require it.
+  - Result: 29 routes: 19 translated, and 10 refused (the three `/archive` routes, `export`, `changes`, `top`, `stats`, `attach/ws`, container `resize` and `update`). The check also forbids the field on other routes and on unsupported routes, and rejects a refusal without a reason.
+- [x] 3.4 Generate `priv/docker/native-create.json` from the pinned API description, with one class per field, a reason for each `ignored` or `refused`, and the recorded differences. Add the check that fails on a missing field.
+  - Result: 95 fields from API 1.57: 27 translated, 9 ignored, 59 refused, plus five recorded differences. `mix docker.reference` derives the field list from the create request schema (`ContainerConfig`, with `HostConfig`, including `Resources`, and `NetworkingConfig` expanded). It fails on a missing, extra or duplicate field, an unknown class, a missing reason or a different API version.
 
 ## 4. Placement, routing and images
 

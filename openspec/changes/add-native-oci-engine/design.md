@@ -106,7 +106,7 @@ The engine image must include skopeo and umoci. The host installs them with dock
 @callback select_engine(Context.t(), create_request :: map()) :: :nested | :native
 ```
 
-It runs during admission for `POST /containers/create` only, under the same deadline, and gets the classified request plus the decoded create body. Without the callback, or on a failing or late answer, the choice is `nested`.
+It runs during admission for `POST /containers/create` only, under the same deadline. It gets the classified request with `:route`, and the decoded create body under `:body`. Without the callback, on a body that is not a JSON object, or on a failing or late answer, the choice is `nested`. Hosts without the callback pay nothing: the body is not decoded for them.
 
 `Opsmaru.Containers.Native.eligibility/1` returns `:ok` or the fields that native cannot honour, so a host can implement "native when eligible". When the host returns `native` for an ineligible request, the request is refused with a Docker-shaped 400 naming each field. It is never sent to nested instead.
 
@@ -120,7 +120,7 @@ It runs during admission for `POST /containers/create` only, under the same dead
 - The README lists SHA-256 digests for linux/arm64 and linux/amd64.
 - `mise run check:init` vets and tests it, then builds both architectures twice from clean caches and fails if the builds differ.
 
-The host passes the binaries in the context as `native_init: %{"aarch64" => path, "x86_64" => path}`. At target validation the library reads each file and checks its SHA-256 against the README's table for that library version. A mismatch or a missing file is a configuration error. Pushing a binary the library does not know would make every exit status and log line untrustworthy. A create whose image architecture has no shim is refused with a named error.
+The host passes the binaries as `%{"aarch64" => path, "x86_64" => path}` to `Opsmaru.Containers.Native.Target.new/2`, with the native project's client. It reads each file once and checks its SHA-256 against the README's table, compiled into that library version. A mismatch, a relative path or a missing file is a configuration error. The result goes in the nested target's optional `native` field. Per-request validation then checks the recorded digests without reading the files again, and the bytes are hashed again when they are pushed. Pushing a binary the library does not know would make every exit status and log line untrustworthy. A create whose image architecture has no shim is refused with a named error.
 
 **Modes.** One binary has four modes, chosen by its first argument. With no argument it runs as init.
 
@@ -220,7 +220,7 @@ When the child exits, the shim drains the pipes, writes the exit record, and exi
 - `run` increases with each start of the container. Log records carry it, so attach and wait can tell one run from the next. `RestartCount` stays 0, because no restart policy runs.
 - It is written once when the child has started (or failed to start), and again with `finished_at` and `exit_code` when it exits.
 - A child killed by a signal gets `exit_code` 128 plus the signal number, and `signal` set.
-- `oom_killed` compares the cgroup's `memory.events` `oom_kill` count before and after the run. Task 2 qualifies that this is visible inside the container. If it is not, it is always false, and `State.OOMKilled` is recorded in the table as a difference.
+- `oom_killed` compares the cgroup's `memory.events` `oom_kill` count before and after the run. Task 2.7 confirmed that this is visible inside the container.
 
 **No exit record.** If the instance stops while the record has no `finished_at`, the shim was killed before it could write one. That happens on a forced stop after the timeout, an administrator's `incus stop --force`, or a crash. The library reports exit code 137 (Docker's SIGKILL code), the finish time of the instance's `instance-shutdown` event, and `State.Error` = `native: exit status not recorded`. Docker reports 137 when a container is killed, so the code is accurate in the cases the library causes. The error string says it was inferred.
 
@@ -311,7 +311,7 @@ Exec IDs route the same way: a native exec ID is an exec record on the container
 - `ignored`: accepted with no effect, with a reason
 - `refused`: rejected when set to a non-default value, with a reason
 
-A check fails when a field is missing from the table, so a new reference release cannot add fields silently.
+The table also records its API version, what counts as a default value, and the recorded differences. `mix docker.reference` fails on a missing, extra or duplicate field, an unknown class, a missing reason or a different API version, so a new reference release cannot add fields silently. The JSON is authoritative. The summary below covers the fields that matter most.
 
 | Docker field | Native translation |
 | --- | --- |
@@ -341,11 +341,11 @@ A check fails when a field is missing from the table, so a new reference release
 
 Translation happens before any Incus mutation. A refused field never leaves a half-created instance.
 
-**Recorded differences.** These are documented, and the differential cases normalise them:
+**Recorded differences.** The table's `differences` list records these, and the differential cases normalise them:
 
 - **Init:** the Docker process is not PID 1 (the spike saw PIDs 12 to 14), so default signal dispositions apply. Under Docker without `--init`, a PID 1 with no SIGTERM handler ignores `docker stop` and is killed after the timeout (exit 137). Natively it exits on SIGTERM (exit 143), as under `docker run --init`.
 - **Hostname files:** the kernel hostname is set, but `/etc/hostname` and `/etc/hosts` are the image's or Incus's, not Docker's generated files.
-- **OOMKilled:** recorded only if task 2.7 confirms the cgroup counter.
+- **Image health checks, image volumes and `/dev/shm`:** an image `HEALTHCHECK` is not run, image `VOLUME` paths stay in the root filesystem, and `/dev/shm` is Incus's rather than Docker's 64 MiB tmpfs.
 
 ### 13. Lifecycle, wait and auto-remove
 
@@ -386,7 +386,7 @@ The spike ran this three times with a command that printed two lines and exited 
 
 ### 15. Route table and evidence
 
-The foundation's `native` class assumed whole routes would move. Container routes instead serve both engines, chosen per container. So container-scoped routes keep class `nested` and gain a `native` field: `translated` or `refused` with a reason. Admission uses it only when the container resolves to native. A route moves to class `native` only when nested no longer serves it at all, which this change does not do.
+The foundation's `native` class assumed whole routes would move. Container routes instead serve both engines, chosen per container. So container-scoped routes keep class `nested` and gain a `native` field: `{"class": "translated"}` or `{"class": "refused", "reason": ...}`. `mix docker.reference` requires it on every nested `/containers` and `/exec/` route and forbids it elsewhere. Admission uses it only when the container resolves to native. A route moves to class `native` only when nested no longer serves it at all, which this change does not do.
 
 Still refused for native containers, with a Docker-shaped error naming the native engine: `docker cp` (`/archive`), `export`, `changes`, `top`, `stats`, `update` and container `resize`. SFTP could serve `/archive` and exec could serve `top` in later changes.
 
