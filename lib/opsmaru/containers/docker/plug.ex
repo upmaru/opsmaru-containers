@@ -12,7 +12,17 @@ if Code.ensure_loaded?(Plug.Conn) do
     """
 
     @behaviour Plug
-    alias Opsmaru.Containers.Docker.{Admission, BindPolicy, Exchange, HTTP}
+    alias Opsmaru.Containers.Docker.{
+      Admission,
+      BindPolicy,
+      EngineRequest,
+      EngineSelection,
+      Exchange,
+      HTTP,
+      Routing
+    }
+
+    alias Opsmaru.Containers.Native.{Exec, Lifecycle, Listing, Logs, Wait}
     alias Opsmaru.Containers.Transport
     alias Opsmaru.Containers.Transport.Stream
 
@@ -87,13 +97,386 @@ if Code.ensure_loaded?(Plug.Conn) do
 
       with {:ok, admission} <- Admission.admit(options.host, request, deadline),
            _ <- Exchange.admit_route(current_exchange(), admission.route, conn.request_path),
-           :ok <- regular_request(conn, admission.route),
-           {:ok, conn, body, framing} <- prepare_body(conn, options.host, admission, deadline) do
-        relay(conn, admission, body, framing, now() + options.stream)
+           :ok <- regular_request(conn, admission.route) do
+        case Routing.route(admission, conn.query_string, deadline) do
+          :nested ->
+            nested(conn, options, request, admission, deadline)
+
+          {:list, containers} ->
+            native_list(conn, admission, containers, now() + options.stream)
+
+          {:prune, containers} ->
+            native_prune(conn, admission, containers, now() + options.stream)
+
+          {:native, container} ->
+            native(conn, admission, container, now() + options.stream)
+
+          {:native_exec, container, exec_id} ->
+            native_exec(conn, admission, container, exec_id, now() + options.stream)
+
+          {:error, status, message} ->
+            refuse(conn, status, message)
+        end
       else
-        {:error, status, message} ->
-          error(conn, status, message, Exchange.refusal_reason(status, message))
+        {:error, status, message} -> refuse(conn, status, message)
       end
+    end
+
+    defp refuse(conn, status, message),
+      do: error(conn, status, message, Exchange.refusal_reason(status, message))
+
+    defp nested(conn, options, request, admission, deadline) do
+      case prepare_body(conn, options.host, request, admission, deadline) do
+        {:ok, conn, body, framing} ->
+          relay(conn, admission, body, framing, now() + options.stream)
+
+        {:native_create, conn, body} ->
+          query = URI.decode_query(conn.query_string)
+          deadline = now() + options.stream
+
+          reply(
+            conn,
+            admission,
+            Lifecycle.create(
+              admission.context,
+              options.host,
+              query,
+              body,
+              admission.maximum,
+              deadline
+            )
+          )
+
+        {:error, status, message} ->
+          refuse(conn, status, message)
+      end
+    end
+
+    # The nested engine answers first, so its own validation and errors reach
+    # the client unchanged. Native entries are merged into its answer.
+    defp native_list(conn, admission, containers, deadline) do
+      target = append_query(admission.path, conn.query_string)
+
+      with {:ok, query} <- Listing.list_query(conn.query_string),
+           {:ok, 200, nested} when is_list(nested) <- engine(admission, "GET", target, deadline),
+           {:ok, native} <-
+             Listing.entries(admission.context, containers, query, admission.maximum, deadline) do
+        json(conn, admission, 200, Listing.merge(nested, native, query))
+      else
+        {:ok, status, body} -> json(conn, admission, status, body)
+        {:error, status, message} -> refuse(conn, status, message)
+        {:error, :engine} -> error(conn, 502, "Docker engine connection failed", :upstream_failed)
+      end
+    end
+
+    defp native_prune(conn, admission, containers, deadline) do
+      target = append_query(admission.path, conn.query_string)
+
+      with {:ok, filters} <- Listing.prune_query(conn.query_string),
+           {:ok, 200, %{} = nested} <- engine(admission, "POST", target, deadline),
+           {:ok, deleted} <- Listing.prune(admission.context, containers, filters, deadline) do
+        body = %{
+          "ContainersDeleted" => (nested["ContainersDeleted"] || []) ++ deleted,
+          "SpaceReclaimed" => nested["SpaceReclaimed"] || 0
+        }
+
+        json(conn, admission, 200, body)
+      else
+        {:ok, status, body} -> json(conn, admission, status, body)
+        {:error, status, message} -> refuse(conn, status, message)
+        {:error, :engine} -> error(conn, 502, "Docker engine connection failed", :upstream_failed)
+      end
+    end
+
+    @native_routes %{
+      "/containers/{name:.*}/start" => :start,
+      "/containers/{name:.*}/stop" => :stop,
+      "/containers/{name:.*}/kill" => :kill,
+      "/containers/{name:.*}/restart" => :restart,
+      "/containers/{name:.*}/pause" => :pause,
+      "/containers/{name:.*}/unpause" => :unpause,
+      "/containers/{name:.*}/rename" => :rename,
+      "/containers/{name:.*}" => :remove,
+      "/containers/{name:.*}/json" => :inspect,
+      "/containers/{name:.*}/wait" => :wait,
+      "/containers/{name:.*}/exec" => :exec_create,
+      "/containers/{name:.*}/logs" => :logs
+    }
+
+    # A request for a container the native engine owns. Nothing reaches the
+    # nested engine except name checks and image handoff reads.
+    defp native(conn, admission, container, deadline) do
+      query = URI.decode_query(conn.query_string)
+      context = admission.context
+
+      case Map.get(@native_routes, admission.route["path"]) do
+        nil ->
+          {:error, status, message} = Routing.unavailable(admission.route)
+          refuse(conn, status, message)
+
+        :wait ->
+          native_wait(conn, admission, container, query, deadline)
+
+        :logs ->
+          native_logs(conn, admission, container, query, deadline)
+
+        :exec_create ->
+          case read_checked_body(conn) do
+            {:ok, body, conn} ->
+              Exchange.request_bytes(current_exchange(), byte_size(body))
+              reply(conn, admission, Exec.create(context, container, body, deadline))
+
+            {:error, status, message} ->
+              refuse(conn, status, message)
+          end
+
+        operation ->
+          reply(
+            conn,
+            admission,
+            lifecycle(operation, context, container, query, admission, deadline)
+          )
+      end
+    end
+
+    # A request for an exec record on a native container.
+    defp native_exec(conn, admission, container, exec_id, deadline) do
+      context = admission.context
+
+      case admission.route["path"] do
+        "/exec/{id:.*}/json" ->
+          reply(conn, admission, Exec.inspect(context, container, exec_id, deadline))
+
+        "/exec/{name:.*}/resize" ->
+          query = URI.decode_query(conn.query_string)
+          reply(conn, admission, Exec.resize(exec_id, container.execs[exec_id], query))
+
+        "/exec/{name:.*}/start" ->
+          with {:ok, body, conn} <- read_checked_body(conn),
+               _ <- Exchange.request_bytes(current_exchange(), byte_size(body)),
+               {:ok, %{detach: true}} <- Exec.start_options(body) do
+            reply(conn, admission, Exec.start_detached(context, container, exec_id, deadline))
+          else
+            {:ok, _} ->
+              refuse(conn, 501, "Docker attached exec requires the host's raw adapter")
+
+            {:error, status, message} ->
+              refuse(conn, status, message)
+          end
+
+        _ ->
+          {:error, status, message} = Routing.unavailable(admission.route)
+          refuse(conn, status, message)
+      end
+    end
+
+    # Logs are streamed as Docker's multiplexed stream. The status line is
+    # sent with the first record, or once the records already written are
+    # read, so a malformed log before any output is still an error status.
+    defp native_logs(conn, admission, container, query, deadline) do
+      case Logs.options(container, query) do
+        {:ok, options} -> stream_logs(conn, admission, container, options, deadline)
+        {:error, status, message} -> refuse(conn, status, message)
+      end
+    end
+
+    defp stream_logs(conn, admission, container, options, deadline) do
+      key = {__MODULE__, :logs_conn}
+      Process.put(key, {:pending, conn})
+      native = admission.context.target.native
+
+      try do
+        with_client_monitor(conn, fn monitor ->
+          emit = &logs_emit(&1, key, admission, monitor)
+
+          native
+          |> Logs.stream(container, options, emit, deadline)
+          |> logs_result(key, admission, monitor)
+        end)
+      after
+        Process.delete(key)
+      end
+    end
+
+    defp logs_result(:ok, key, admission, monitor) do
+      logs_emit(:begin, key, admission, monitor)
+      {_, conn} = Process.get(key)
+      conn
+    end
+
+    # An error after the status line went out ends the stream.
+    defp logs_result({:error, status, message}, key, _, _) do
+      case Process.get(key) do
+        {:pending, conn} -> refuse(conn, status, message)
+        {_, conn} -> conn
+      end
+    end
+
+    defp logs_emit(:poll, _, _, monitor), do: if(client_gone?(monitor), do: :halt, else: :ok)
+
+    defp logs_emit(:begin, key, admission, _) do
+      case Process.get(key) do
+        {:pending, conn} ->
+          Exchange.sent(current_exchange(), :sent)
+          Exchange.commit(current_exchange(), 200)
+
+          conn =
+            conn
+            |> Plug.Conn.put_resp_content_type("application/vnd.docker.multiplexed-stream", nil)
+            |> Plug.Conn.put_resp_header("api-version", admission.maximum)
+
+          Process.put(key, {:open, write_response(fn -> Plug.Conn.send_chunked(conn, 200) end)})
+          :ok
+
+        {:open, _} ->
+          :ok
+
+        {:closed, _} ->
+          :halt
+      end
+    end
+
+    defp logs_emit({:data, data}, key, admission, monitor) do
+      with :ok <- logs_emit(:begin, key, admission, monitor) do
+        {:open, conn} = Process.get(key)
+        bytes = IO.iodata_to_binary(data)
+
+        case chunk(conn, bytes) do
+          {:ok, conn} ->
+            Exchange.response_bytes(current_exchange(), byte_size(bytes))
+            Process.put(key, {:open, conn})
+            :ok
+
+          {:error, _} ->
+            Exchange.interrupt(current_exchange(), :caller_closed)
+            Process.put(key, {:closed, conn})
+            :halt
+        end
+      end
+    end
+
+    defp lifecycle(:start, context, container, _, _, deadline),
+      do: Lifecycle.start(context, container, deadline)
+
+    defp lifecycle(:stop, context, container, query, _, deadline),
+      do: Lifecycle.stop(context, container, query, deadline)
+
+    defp lifecycle(:kill, context, container, query, _, deadline),
+      do: Lifecycle.kill(context, container, query, deadline)
+
+    defp lifecycle(:restart, context, container, query, _, deadline),
+      do: Lifecycle.restart(context, container, query, deadline)
+
+    defp lifecycle(:pause, context, container, _, _, deadline),
+      do: Lifecycle.pause(context, container, deadline)
+
+    defp lifecycle(:unpause, context, container, _, _, deadline),
+      do: Lifecycle.unpause(context, container, deadline)
+
+    defp lifecycle(:rename, context, container, query, admission, deadline),
+      do: Lifecycle.rename(context, container, query, admission.maximum, deadline)
+
+    defp lifecycle(:remove, context, container, query, _, deadline),
+      do: Lifecycle.remove(context, container, query, deadline)
+
+    defp lifecycle(:inspect, context, container, _, _, deadline),
+      do: Lifecycle.inspect(context, container, deadline)
+
+    defp reply(conn, admission, {:ok, status, body}), do: json(conn, admission, status, body)
+
+    defp reply(conn, admission, {:ok, status}) do
+      Exchange.sent(current_exchange(), :sent)
+      Exchange.commit(current_exchange(), status)
+      conn = Plug.Conn.put_resp_header(conn, "api-version", admission.maximum)
+      write_response(fn -> Plug.Conn.send_resp(conn, status, "") end)
+    end
+
+    defp reply(conn, _, {:error, status, message}), do: refuse(conn, status, message)
+
+    # dockerd sends the status line before it waits, so a client sees the
+    # wait begin. The result follows as the only body chunk. A client that
+    # disconnects ends the wait with no answer and no removal.
+    defp native_wait(conn, admission, container, query, deadline) do
+      with {:ok, condition} <- Wait.condition(query["condition"]),
+           {:ok, waiter} <- Wait.begin(admission.context, container, condition, deadline) do
+        try do
+          Exchange.sent(current_exchange(), :sent)
+          Exchange.commit(current_exchange(), 200)
+
+          conn =
+            conn
+            |> Plug.Conn.put_resp_content_type("application/json", nil)
+            |> Plug.Conn.put_resp_header("api-version", admission.maximum)
+
+          conn = write_response(fn -> Plug.Conn.send_chunked(conn, 200) end)
+
+          with_client_monitor(conn, fn monitor ->
+            case Wait.run(waiter, deadline, fn -> client_gone?(monitor) end) do
+              {:ok, body} ->
+                wait_chunk(conn, body)
+
+              :cancelled ->
+                Exchange.interrupt(current_exchange(), :caller_closed)
+                conn
+
+              {:error, _, message} ->
+                wait_chunk(conn, %{"StatusCode" => -1, "Error" => %{"Message" => message}})
+            end
+          end)
+        after
+          Wait.close(waiter)
+        end
+      else
+        {:error, status, message} -> refuse(conn, status, message)
+      end
+    end
+
+    defp wait_chunk(conn, body) do
+      encoded = Jason.encode!(body) <> "\n"
+
+      case chunk(conn, encoded) do
+        {:ok, conn} ->
+          Exchange.response_bytes(current_exchange(), byte_size(encoded))
+          conn
+
+        {:error, _} ->
+          Exchange.interrupt(current_exchange(), :caller_closed)
+          conn
+      end
+    end
+
+    defp client_gone?(nil), do: false
+
+    defp client_gone?(monitor) do
+      receive do
+        {:DOWN, ^monitor, :process, _, _} -> true
+      after
+        0 -> false
+      end
+    end
+
+    defp engine(admission, method, target, deadline) do
+      Exchange.sent(current_exchange(), Exchange.dialed_outcome(method))
+      body = if method == "POST", do: "", else: nil
+
+      case EngineRequest.json(admission.context, method, target, body, deadline) do
+        {:ok, _, _} = result -> result
+        {:error, _} -> {:error, :engine}
+      end
+    end
+
+    defp json(conn, admission, status, body) do
+      Exchange.sent(current_exchange(), :sent)
+      Exchange.commit(current_exchange(), status)
+      encoded = Jason.encode!(body)
+      Exchange.response_bytes(current_exchange(), byte_size(encoded))
+
+      conn =
+        conn
+        |> Plug.Conn.put_resp_content_type("application/json", nil)
+        |> Plug.Conn.put_resp_header("api-version", admission.maximum)
+
+      write_response(fn -> Plug.Conn.send_resp(conn, status, encoded) end)
     end
 
     defp regular_request(conn, route) do
@@ -106,22 +489,38 @@ if Code.ensure_loaded?(Plug.Conn) do
       end
     end
 
-    defp prepare_body(conn, host, %{route: %{"path" => path}} = admission, deadline)
+    defp prepare_body(conn, host, request, %{route: %{"path" => path}} = admission, deadline)
          when path in @guarded_paths do
       with {:ok, bytes, conn} <- read_checked_body(conn),
            _ <- Exchange.request_bytes(current_exchange(), byte_size(bytes)),
-           :ok <- detached_exec(path, bytes),
-           {:ok, bytes} <- BindPolicy.apply(host, admission, bytes, deadline) do
-        {:ok, conn, bytes, {:length, byte_size(bytes)}}
+           :ok <- detached_exec(path, bytes) do
+        checked_body(conn, host, request, admission, bytes, deadline)
       end
     end
 
-    defp prepare_body(conn, _, _, _) do
+    defp prepare_body(conn, _, _, _, _) do
       case request_framing(conn) do
         {:error, _, _} = failure -> failure
         framing -> {:ok, conn, :stream, framing}
       end
     end
+
+    defp checked_body(conn, host, request, admission, bytes, deadline) do
+      case engine_for(admission.route["path"], host, request, admission, bytes, deadline) do
+        :native ->
+          {:native_create, conn, bytes}
+
+        :nested ->
+          with {:ok, bytes} <- BindPolicy.apply(host, admission, bytes, deadline),
+               do: {:ok, conn, bytes, {:length, byte_size(bytes)}}
+      end
+    end
+
+    # A create the host routes to native is never sent to nested instead.
+    defp engine_for("/containers/create", host, request, admission, bytes, deadline),
+      do: EngineSelection.select(host, request, admission, bytes, deadline)
+
+    defp engine_for(_, _, _, _, _, _), do: :nested
 
     defp detached_exec("/exec/{name:.*}/start", bytes) do
       case Jason.decode(bytes, objects: :ordered_objects) do

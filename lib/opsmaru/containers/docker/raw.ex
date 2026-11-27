@@ -27,11 +27,14 @@ defmodule Opsmaru.Containers.Docker.Raw do
   reads it back from there.
   """
 
-  alias Opsmaru.Containers.Docker.{Admission, Exchange, HTTP, RawTunnel}
+  alias Opsmaru.Containers.Docker.{Admission, Exchange, HTTP, RawTunnel, Routing}
+  alias Opsmaru.Containers.Native.{Exec, Logs}
   alias Opsmaru.Containers.Transport
   alias Opsmaru.Containers.Transport.Stream
 
   @max_body 1_048_576
+  @multiplexed "application/vnd.docker.multiplexed-stream"
+  @raw_stream "application/vnd.docker.raw-stream"
   @exchange_key {Opsmaru.Containers.Docker.Raw, :exchange}
 
   @doc """
@@ -57,17 +60,113 @@ defmodule Opsmaru.Containers.Docker.Raw do
     with {:ok, admission} <- Admission.admit(host, request, admission_deadline),
          :ok <- admit_exchange(exchange, request, admission),
          {:ok, protocol, framing} <- handshake(request, admission.route),
+         :nested <- raw_route(admission, request, protocol, admission_deadline, deadline),
          {:ok, backend} <- dial(admission.context, deadline) do
       Exchange.sent(exchange, Exchange.dialed_outcome(request.method))
 
       exchange_phase(request, admission, backend, protocol, framing, deadline, exchange)
     else
+      {:native, response, stream} ->
+        Exchange.sent(exchange, :sent)
+        Exchange.commit(exchange, response.status)
+        {:upgrade, response, stream, ""}
+
+      {:native_done, status, headers} ->
+        Exchange.sent(exchange, :sent)
+        Exchange.commit(exchange, status)
+        finish_exchange(exchange)
+        {:http, status, headers, ""}
+
       {:error, status, message} ->
         refuse(exchange, status, message, Exchange.refusal_reason(status, message))
 
       {:error, status, message, reason} ->
         refuse(exchange, status, message, reason)
     end
+  end
+
+  # Native output-only attach and attached exec are served by a
+  # `Native.Pipe`, which the tunnel relays as it relays a nested engine's
+  # stream. The pipe is opened before the head is written, so every refusal
+  # is still an HTTP answer.
+  defp raw_route(admission, request, protocol, admission_deadline, deadline) do
+    case Routing.route(admission, request.query, admission_deadline) do
+      :nested ->
+        :nested
+
+      {:error, _, _} = error ->
+        error
+
+      {:native, container} ->
+        native_raw(admission, container, request, protocol, deadline)
+
+      {:native_exec, container, exec_id} ->
+        native_exec(admission, container, exec_id, request, protocol, deadline)
+
+      _ ->
+        Routing.unavailable(admission.route)
+    end
+  end
+
+  defp native_raw(
+         %{route: %{"path" => "/containers/{name:.*}/attach"}} = admission,
+         container,
+         request,
+         protocol,
+         deadline
+       ) do
+    query = URI.decode_query(request.query)
+
+    case Logs.attach(admission.context.target.native, container, query, deadline) do
+      {:ok, stream} -> native_stream(admission, stream, @multiplexed, protocol)
+      {:error, _, _} = error -> error
+      {:error, _} -> {:error, 503, "native engine: Incus is not available"}
+    end
+  end
+
+  defp native_raw(admission, _, _, _, _), do: Routing.unavailable(admission.route)
+
+  defp native_exec(
+         %{route: %{"path" => "/exec/{name:.*}/start"}} = admission,
+         container,
+         exec_id,
+         request,
+         protocol,
+         deadline
+       ) do
+    context = admission.context
+
+    case Exec.start_options(request.body) do
+      {:ok, %{detach: true}} ->
+        Exec.start_detached(context, container, exec_id, deadline)
+        |> exec_started(admission, protocol)
+
+      {:ok, options} ->
+        Exec.start_attached(context, container, exec_id, options, deadline)
+        |> exec_started(admission, protocol)
+
+      error ->
+        error
+    end
+  end
+
+  defp native_exec(admission, _, _, _, _, _), do: Routing.unavailable(admission.route)
+
+  defp exec_started({:ok, status}, admission, _),
+    do: {:native_done, status, [{"api-version", admission.maximum}]}
+
+  defp exec_started({:ok, stream, tty}, admission, protocol),
+    do: native_stream(admission, stream, if(tty, do: @raw_stream, else: @multiplexed), protocol)
+
+  defp exec_started(error, _, _), do: error
+
+  defp native_stream(admission, stream, content_type, protocol) do
+    headers =
+      [{"content-type", content_type}, {"api-version", admission.maximum}] ++
+        connection_headers(protocol)
+
+    {:native, %{status: if(protocol, do: 101, else: 200), protocol: protocol, headers: headers},
+     stream}
   end
 
   defp refuse(exchange, status, message, reason) do

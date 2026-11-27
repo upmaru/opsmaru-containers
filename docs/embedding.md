@@ -271,13 +271,185 @@ Events never carry:
 - error messages;
 - a path admission refused.
 
+## Route containers to the native engine
+
+A host can run selected containers as Incus OCI application containers in a
+project of its own, instead of inside dockerd. They are full Incus
+instances, so Incus tooling, quotas and placement see them. Create, start,
+stop, kill, restart, pause, unpause, rename, remove, inspect, wait, logs,
+output-only attach and exec are served for them, and listing and prune
+cover both engines. Attach and attached exec need the raw handoff, as they
+do for nested containers; the library serves them from a stream of its own,
+so the host's listener code is unchanged. Hosts that never opt in keep
+today's behaviour exactly, and no Incus call is made for routing.
+
+### Opt in
+
+- **Target:** build `Opsmaru.Containers.Native.Target.new/2` from a client
+  for the native project and a map of guest architecture to shim binary
+  path, such as `%{"aarch64" => "/path/to/native-init-arm64"}`. Put it in
+  the nested target's `native` field, and build the capabilities snapshot
+  with that same target. The native project must differ from the engine's
+  project and share its Incus owner and identity.
+- **Choice:** implement the optional `select_engine/2` callback and return
+  `:native` for the creates you want native. Call
+  `Opsmaru.Containers.Native.eligibility/1` on the decoded body to choose
+  native only when it can run there. A body the native engine cannot honour
+  is refused with a 400 naming each field, never sent to nested instead.
+- **Binds:** native bind sources go through `map_bind_source/2`, then become
+  Incus disk devices of the native instance. Return the source path as the
+  native project's Incus server sees it. Without the callback, native
+  creates with binds are refused. Inspect reports the mapped source, as
+  dockerd reports the source the nested bind policy rewrote.
+- **Routing:** with a native target, each container and exec route lists the
+  native project once to find the engine that owns the reference.
+- **Serialize creates and renames:** names are unique across engines. Each
+  engine checks the other before it creates or renames, so serialize
+  container creates and renames per target, as you serialize engine lifecycle
+  calls. Two hosts sharing a target need the same serialization.
+
+### Build and pass the shim
+
+Every native container runs the library's init shim as its entrypoint. The
+package ships its source only, in `priv/native_init`, and no binary is built
+at compile time. Build it for each guest architecture you run with the
+recipe in [`priv/native_init/README.md`](../priv/native_init/README.md).
+The build is reproducible: `Native.Target.new/2` refuses a binary whose
+SHA-256 is not the one the library lists for that architecture, and the
+README's digests come from `mise run check:init`. A create for an image
+architecture without a shim is refused before any instance is made. The
+library pushes the shim and the process spec into each new instance before
+its first start.
+
+### Prepare the engine and the native project
+
+- **Engine image:** a native container's image is copied out of dockerd
+  with `skopeo`, unpacked with `umoci` inside the engine instance, and
+  uploaded to the native project. The engine image needs both tools.
+- **Incus:** the server needs the `instance_oci` API extension. The
+  acceptance run used Incus 7.0.1.
+- **Root size:** the library sets none, so the native project's default
+  profile chooses it. On a ZFS pool with `volume.zfs.reserve_space=true`,
+  each instance reserves its full root size up front, and the default
+  2 GiB lets about a dozen containers exhaust a 30 GiB pool. Give the
+  project a small root size (the acceptance run used 256 MiB) or a
+  different pool policy.
+- **Network:** `bridge` and the default network mode use the project
+  profile's `eth0`. `--network none` replaces it with no network.
+
+### Translation, refusals and differences
+
+`priv/docker/native-create.json` classifies every create field of the
+pinned API as `translated`, `ignored` or `refused`, with a reason; `mix
+docker.reference --check` fails when it drifts from the API description. In
+brief:
+
+- **Translated:** image, entrypoint and command, environment, working
+  directory, user and group additions, hostname, stop signal and timeout,
+  labels, bind mounts, memory, CPU (`--cpus`, quota and period, cpuset),
+  PIDs limit, DNS, the `bridge`, default and `none` network modes, the log
+  driver (`local`, `json-file` or `none`, with size and file count),
+  auto-remove, and restart policy `no`.
+- **Ignored:** `Init` (native containers always run under an init) and
+  `ExposedPorts` (image metadata; nothing is published).
+- **Refused, for now or by design:** a TTY and stdin for the main process
+  (`-t`, `-i`), port publishing, networks other than the three above,
+  volumes (named, anonymous and `--volumes-from`), tmpfs mounts, a create
+  health check, `--privileged`, capabilities, devices, security options,
+  namespace sharing, extra hosts, a read-only root, links, restart policies
+  other than `no`, and limits Incus has no exact key for (CPU shares, block
+  I/O, swap, ulimits, sysctls, `--shm-size`).
+
+Routes refused for native containers, with a 501 naming the native engine:
+`docker cp`, `export`, `diff`, `top`, `stats`, `update`, main-process TTY
+resize and websocket attach. Stdin attach and attach with `logs=1` get the
+same 501, and logs with `details` a 400.
+
+Recorded differences from a Docker container:
+
+- **Exit status and logs are written by the container.** The shim records
+  each run's exit status and writes stdout and stderr inside the
+  container's root filesystem, under `/.opsmaru`, which only root can read.
+  The library parses them as untrusted, bounded input, but the container's
+  own root user can falsify or delete them; dockerd keeps the same data
+  outside the container. Logs use the container's disk, bounded by the log
+  driver's rotation.
+- **Forced stops:** a stop that Incus forces (a stop past its timeout plus
+  10 s, or a kill the shim cannot deliver) leaves no exit record. The
+  container then reports exit 137 with `State.Error` set to
+  `native: exit status not recorded`.
+- **Init:** the Docker process is not PID 1, so it behaves as under
+  `docker run --init`: a process with no SIGTERM handler exits on `docker
+  stop` with 143, where a Docker PID 1 would ignore it and be killed with
+  137 after the timeout.
+- **Hostname files:** the kernel hostname is set, but `/etc/hostname` and
+  `/etc/hosts` are the image's or Incus's, not Docker's generated files.
+- **Image health checks, image volumes and `/dev/shm`:** a `HEALTHCHECK` is
+  not run, `VOLUME` paths stay in the root filesystem, and `/dev/shm` is
+  Incus's rather than Docker's 64 MiB tmpfs.
+- **Generated names:** a create without a name gets its instance name (`oc-`
+  and 12 hex characters), not an `adjective_surname` name.
+- **Listing:** native entries carry no `SizeRw` or `SizeRootFs`, `ancestor`
+  filters match image IDs without descendant images, and prune's
+  `SpaceReclaimed` counts only the nested engine.
+
+### Images, auto-remove and deadlines
+
+- **Double image storage:** each image a native container uses is stored
+  twice, in dockerd and as an Incus image in the native project, copied
+  once per image ID. The first native run of a large image takes tens of
+  seconds (500 MB took about 31 s in the qualification spike). Removing an
+  image from dockerd does not remove its Incus copy. Call
+  `Opsmaru.Containers.Native.prune_images/2` on your own schedule to
+  delete copies that no instance uses.
+- **Auto-remove:** `docker run --rm` removes its container when the CLI's
+  wait answers. A client that disconnects first leaves the stopped
+  instance. Call `Opsmaru.Containers.Native.reap/2` on your own schedule to
+  delete those.
+- **Wait and stop deadlines:** native wait, stop and restart run within the
+  Plug's `:stream_timeout`, as relayed requests do.
+
+### Keep Compose nested
+
+Compose projects need what the native engine refuses: a project network,
+named volumes, published ports and often a TTY or stdin. Route them to
+nested, for example by returning `:nested` from `select_engine/2` for any
+create that carries the `com.docker.compose.project` label. A Compose
+project split across engines would also lose its shared network.
+
+### Native acceptance
+
+The native differential runs one pinned CLI workflow against a nested and a
+native container from the same image, and compares exit codes, output,
+inspect fields, mounts and limits. It normalises only volatile IDs,
+generated names and its own run tag. It needs a listener that serves the
+library on two Unix sockets in one directory, `nested.sock` and
+`native.sock`, which differ only in the engine chosen at create.
+`scripts/acceptance/native_listener.exs` is such a listener. Run both only
+against an isolated Incus project with disposable fixtures; see each
+script's header for its variables.
+
+```sh
+OPSMARU_DOCKER_ACCEPTANCE=isolated \
+OPSMARU_DOCKER_CLI=/absolute/docker \
+OPSMARU_NESTED_SOCKET=/absolute/nested.sock \
+OPSMARU_NATIVE_SOCKET=/absolute/native.sock \
+OPSMARU_DOCKER_TEST_IMAGE=alpine:3.22 \
+mise exec -- node test/acceptance/native_differential.mjs
+```
+
+The image must already be in the nested engine. The recorded run and its
+results are in [the native acceptance report](native-oci-acceptance.md).
+
 ## Scope
 
 The reference tracks Docker Engine and CLI 29.10.0, Buildx 0.39.1 with the
 Docker driver, and Compose 5.8.0. See the route inventory and evidence ledger
 under `priv/docker` for supported routes and recorded checks. The ledger
 distinguishes scripted fixtures, real-engine differential checks, real-Incus
-acceptance and consumer acceptance.
+acceptance and consumer acceptance. Routes that serve native containers keep
+native evidence in a separate `native` object, so nested passthrough
+evidence never counts for native containers.
 
 Container bind mounts require a host path mapping. Custom volume-driver
 options are refused, including named volumes with local-driver bind

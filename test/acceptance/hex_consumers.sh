@@ -11,17 +11,20 @@ mix hex.build --unpack --output "$workspace/package"
 
 for file in priv/docker/reference.json priv/docker/routes.json priv/docker/coverage.json \
   priv/docker/openapi.yaml.gz priv/notices/moby-api-LICENSE priv/notices/moby-NOTICE \
-  priv/exec_bridge/exec_socket_bridge.go priv/exec_bridge/go.mod priv/exec_bridge/README.md
+  priv/exec_bridge/exec_socket_bridge.go priv/exec_bridge/go.mod priv/exec_bridge/README.md \
+  priv/native_init/main.go priv/native_init/init.go priv/native_init/go.mod priv/native_init/README.md
 do
   test -s "$workspace/package/$file"
 done
 
-# The exec bridge helper ships as source only: no built binary.
-extra=$(find "$workspace/package/priv/exec_bridge" -type f ! -name '*.go' ! -name go.mod ! -name README.md)
-if [ -n "$extra" ]; then
-  printf 'Unexpected files in priv/exec_bridge:\n%s\n' "$extra" >&2
-  exit 1
-fi
+# The exec bridge helper and the init shim ship as source only: no built binary.
+for helper in exec_bridge native_init; do
+  extra=$(find "$workspace/package/priv/$helper" -type f ! -name '*.go' ! -name go.mod ! -name README.md)
+  if [ -n "$extra" ]; then
+    printf 'Unexpected files in priv/%s:\n%s\n' "$helper" "$extra" >&2
+    exit 1
+  fi
+done
 
 for profile in headless web; do
   mkdir "$workspace/$profile"

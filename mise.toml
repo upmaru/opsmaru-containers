@@ -27,8 +27,12 @@ run = "sh test/acceptance/hex_consumers.sh"
 description = "Vet, test and reproducibly build the packaged exec bridge helper"
 run = "sh scripts/check_bridge.sh"
 
+[tasks."check:init"]
+description = "Vet, test and reproducibly build the packaged native init shim, and check its README digests"
+run = "sh scripts/check_init.sh"
+
 [tasks.check]
-description = "Format, compile, strict Credo, library/fixture tests and the bridge helper; no real backend"
+description = "Format, compile, strict Credo, library/fixture tests, the bridge helper and the init shim; no real backend"
 run = [
   "mix format --check-formatted",
   "mix compile --warnings-as-errors",
@@ -37,4 +41,5 @@ run = [
   "mix docker.reference --check",
   "openspec validate --all --strict --no-interactive",
   "sh scripts/check_bridge.sh",
+  "sh scripts/check_init.sh",
 ]
