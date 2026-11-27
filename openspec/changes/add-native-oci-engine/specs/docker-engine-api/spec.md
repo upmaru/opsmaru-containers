@@ -27,7 +27,7 @@ Every container-scoped and exec-scoped route SHALL be resolved to the engine tha
 
 ### Requirement: Merged container listing and names
 
-Container listing SHALL merge the nested engine's containers with native containers, applying `all`, `limit`, `size` and the filters `id`, `name`, `label`, `status` and `ancestor` to both. Any other filter SHALL be refused with a Docker-shaped 400 while native containers exist. Container prune SHALL prune both engines and report the combined result. A container name SHALL be unique across both engines: a create with a name used in either engine SHALL produce the engine's name conflict error. The host SHALL serialize container creates per target.
+Container listing SHALL merge the nested engine's containers with native containers, applying `all`, `limit`, `size` and the filters `id`, `name`, `label`, `status`, `ancestor` and `exited` to both. Any other filter SHALL be refused with a Docker-shaped 400 while native containers exist. Container prune SHALL prune both engines and report the combined result. A container name SHALL be unique across both engines: a create with a name used in either engine SHALL produce the engine's name conflict error. The host SHALL serialize container creates per target.
 
 #### Scenario: One list
 

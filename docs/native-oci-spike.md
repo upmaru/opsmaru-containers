@@ -25,7 +25,7 @@ Task 1 of [add-native-oci-engine](../openspec/changes/add-native-oci-engine/task
 - A wrapper entrypoint that wrote `$?` to a file on the rootfs, read through the files API after the container stopped, returned `3` as expected.
 - A file pushed through the files API into a created, never-started OCI container ran as its entrypoint (`/oc-helper`) on first start.
 
-Together these support a packaged init shim. The library would push it into each native container before first start and make it the entrypoint. It would read the exact argv from a file, forward signals, record exit status and time, and write stdout and stderr to separate timestamped files. That would cover gates 1.1, 1.2 and 1.4 without Incus changes. It is a design decision for the re-plan, not a result.
+Together these support a packaged init shim. The library would push it into each native container before first start and make it the entrypoint. It would read the exact argv from a file, forward signals, record exit status and time, and write stdout and stderr to separate timestamped files. That would cover gates 1.1, 1.2 and 1.4 without Incus changes. The re-planned [design](../openspec/changes/add-native-oci-engine/design.md) adopts it, and task 2 of the change qualifies it in a second spike.
 
 **Other observations**
 - On a ZFS pool with `volume.zfs.reserve_space=true`, each native container reserves its full root size (2 GiB by default) up front. About a dozen probe containers exhausted a 29.5 GiB pool, and creates then failed (`size is greater than available space`). A native project needs a small root size or a different pool policy.
