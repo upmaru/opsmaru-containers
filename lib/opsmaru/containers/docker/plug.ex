@@ -22,7 +22,7 @@ if Code.ensure_loaded?(Plug.Conn) do
       Routing
     }
 
-    alias Opsmaru.Containers.Native.{Lifecycle, Listing, Wait}
+    alias Opsmaru.Containers.Native.{Exec, Lifecycle, Listing, Logs, Wait}
     alias Opsmaru.Containers.Transport
     alias Opsmaru.Containers.Transport.Stream
 
@@ -111,6 +111,9 @@ if Code.ensure_loaded?(Plug.Conn) do
           {:native, container} ->
             native(conn, admission, container, now() + options.stream)
 
+          {:native_exec, container, exec_id} ->
+            native_exec(conn, admission, container, exec_id, now() + options.stream)
+
           {:error, status, message} ->
             refuse(conn, status, message)
         end
@@ -195,7 +198,9 @@ if Code.ensure_loaded?(Plug.Conn) do
       "/containers/{name:.*}/rename" => :rename,
       "/containers/{name:.*}" => :remove,
       "/containers/{name:.*}/json" => :inspect,
-      "/containers/{name:.*}/wait" => :wait
+      "/containers/{name:.*}/wait" => :wait,
+      "/containers/{name:.*}/exec" => :exec_create,
+      "/containers/{name:.*}/logs" => :logs
     }
 
     # A request for a container the native engine owns. Nothing reaches the
@@ -212,12 +217,141 @@ if Code.ensure_loaded?(Plug.Conn) do
         :wait ->
           native_wait(conn, admission, container, query, deadline)
 
+        :logs ->
+          native_logs(conn, admission, container, query, deadline)
+
+        :exec_create ->
+          case read_checked_body(conn) do
+            {:ok, body, conn} ->
+              Exchange.request_bytes(current_exchange(), byte_size(body))
+              reply(conn, admission, Exec.create(context, container, body, deadline))
+
+            {:error, status, message} ->
+              refuse(conn, status, message)
+          end
+
         operation ->
           reply(
             conn,
             admission,
             lifecycle(operation, context, container, query, admission, deadline)
           )
+      end
+    end
+
+    # A request for an exec record on a native container.
+    defp native_exec(conn, admission, container, exec_id, deadline) do
+      context = admission.context
+
+      case admission.route["path"] do
+        "/exec/{id:.*}/json" ->
+          reply(conn, admission, Exec.inspect(context, container, exec_id, deadline))
+
+        "/exec/{name:.*}/resize" ->
+          query = URI.decode_query(conn.query_string)
+          reply(conn, admission, Exec.resize(exec_id, container.execs[exec_id], query))
+
+        "/exec/{name:.*}/start" ->
+          with {:ok, body, conn} <- read_checked_body(conn),
+               _ <- Exchange.request_bytes(current_exchange(), byte_size(body)),
+               {:ok, %{detach: true}} <- Exec.start_options(body) do
+            reply(conn, admission, Exec.start_detached(context, container, exec_id, deadline))
+          else
+            {:ok, _} ->
+              refuse(conn, 501, "Docker attached exec requires the host's raw adapter")
+
+            {:error, status, message} ->
+              refuse(conn, status, message)
+          end
+
+        _ ->
+          {:error, status, message} = Routing.unavailable(admission.route)
+          refuse(conn, status, message)
+      end
+    end
+
+    # Logs are streamed as Docker's multiplexed stream. The status line is
+    # sent with the first record, or once the records already written are
+    # read, so a malformed log before any output is still an error status.
+    defp native_logs(conn, admission, container, query, deadline) do
+      case Logs.options(container, query) do
+        {:ok, options} -> stream_logs(conn, admission, container, options, deadline)
+        {:error, status, message} -> refuse(conn, status, message)
+      end
+    end
+
+    defp stream_logs(conn, admission, container, options, deadline) do
+      key = {__MODULE__, :logs_conn}
+      Process.put(key, {:pending, conn})
+      native = admission.context.target.native
+
+      try do
+        with_client_monitor(conn, fn monitor ->
+          emit = &logs_emit(&1, key, admission, monitor)
+
+          native
+          |> Logs.stream(container, options, emit, deadline)
+          |> logs_result(key, admission, monitor)
+        end)
+      after
+        Process.delete(key)
+      end
+    end
+
+    defp logs_result(:ok, key, admission, monitor) do
+      logs_emit(:begin, key, admission, monitor)
+      {_, conn} = Process.get(key)
+      conn
+    end
+
+    # An error after the status line went out ends the stream.
+    defp logs_result({:error, status, message}, key, _, _) do
+      case Process.get(key) do
+        {:pending, conn} -> refuse(conn, status, message)
+        {_, conn} -> conn
+      end
+    end
+
+    defp logs_emit(:poll, _, _, monitor), do: if(client_gone?(monitor), do: :halt, else: :ok)
+
+    defp logs_emit(:begin, key, admission, _) do
+      case Process.get(key) do
+        {:pending, conn} ->
+          Exchange.sent(current_exchange(), :sent)
+          Exchange.commit(current_exchange(), 200)
+
+          conn =
+            conn
+            |> Plug.Conn.put_resp_content_type("application/vnd.docker.multiplexed-stream", nil)
+            |> Plug.Conn.put_resp_header("api-version", admission.maximum)
+
+          Process.put(key, {:open, write_response(fn -> Plug.Conn.send_chunked(conn, 200) end)})
+          :ok
+
+        {:open, _} ->
+          :ok
+
+        {:closed, _} ->
+          :halt
+      end
+    end
+
+    defp logs_emit({:data, data}, key, admission, monitor) do
+      with :ok <- logs_emit(:begin, key, admission, monitor) do
+        {:open, conn} = Process.get(key)
+        bytes = IO.iodata_to_binary(data)
+
+        case chunk(conn, bytes) do
+          {:ok, conn} ->
+            Exchange.response_bytes(current_exchange(), byte_size(bytes))
+            Process.put(key, {:open, conn})
+            :ok
+
+          {:error, _} ->
+            Exchange.interrupt(current_exchange(), :caller_closed)
+            Process.put(key, {:closed, conn})
+            :halt
+        end
       end
     end
 

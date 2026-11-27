@@ -12,6 +12,7 @@ defmodule Opsmaru.Containers.Docker.Routing do
           | {:list, [map()]}
           | {:prune, [map()]}
           | {:native, Opsmaru.Containers.Native.Container.t()}
+          | {:native_exec, Opsmaru.Containers.Native.Container.t(), String.t()}
           | {:error, pos_integer(), String.t()}
 
   @spec route(map(), String.t(), integer()) :: t()
@@ -38,7 +39,7 @@ defmodule Opsmaru.Containers.Docker.Routing do
 
     case Enum.find(containers, &Map.has_key?(&1.execs, exec_id)) do
       nil -> :nested
-      _container -> unavailable(admission.route)
+      container -> {:native_exec, container, exec_id}
     end
   end
 

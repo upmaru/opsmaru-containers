@@ -45,16 +45,11 @@ defmodule Opsmaru.Containers.Native.RoutingTest do
 
   test "a native container by ID or name is never relayed to nested", %{context: context} do
     for reference <- [@web, "web", "/web"] do
-      path = "/containers/#{URI.encode_www_form(reference)}/logs"
+      path = "/containers/#{URI.encode_www_form(reference)}/top"
 
-      assert {501, %{"message" => message}} = await(request(context, "GET", path))
-
-      assert message ==
-               "native engine: /containers/{name:.*}/logs is not available in this release"
+      assert {501, %{"message" => "native engine: top is not served for native containers"}} =
+               await(request(context, "GET", path))
     end
-
-    assert {501, %{"message" => "native engine: top is not served for native containers"}} =
-             await(request(context, "GET", "/containers/web/top"))
 
     refute_received {:dialed, _}
     assert_received {:incus, :list_instances}
@@ -116,7 +111,8 @@ defmodule Opsmaru.Containers.Native.RoutingTest do
       %{state | instances: [web | rest]}
     end)
 
-    assert {501, _} = await(request(context, "GET", "/exec/#{exec_id}/json"))
+    assert {200, %{"ID" => ^exec_id, "ContainerID" => @web, "Running" => false}} =
+             await(request(context, "GET", "/exec/#{exec_id}/json"))
 
     task = request(context, "GET", "/exec/#{String.duplicate("f", 64)}/json")
     serve(engine, 404, ~s({"message":"No such exec instance"}))
@@ -270,11 +266,13 @@ defmodule Opsmaru.Containers.Native.RoutingTest do
     assert :ok = check.("free", 404, ~s({"message":"No such container: free"}))
   end
 
-  test "raw streams on native containers are refused before dialing", %{context: context} do
+  test "a refused raw stream on a native container is answered before dialing", %{
+    context: context
+  } do
     request = %{
       method: "POST",
       path: "/containers/web/attach",
-      query: "stream=1&stdout=1",
+      query: "stream=1&stdout=1&stdin=1",
       peer: {127, 0, 0, 1},
       host_peer: {context, self()},
       headers: [{"upgrade", "tcp"}, {"connection", "Upgrade"}],
@@ -287,7 +285,7 @@ defmodule Opsmaru.Containers.Native.RoutingTest do
                deadline: deadline()
              )
 
-    assert %{"message" => "native engine: " <> _} = Jason.decode!(body)
+    assert %{"message" => "native engine cannot honour: stdin attach"} = Jason.decode!(body)
     refute_received {:dialed, _}
   end
 

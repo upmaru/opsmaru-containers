@@ -19,6 +19,11 @@ defmodule Opsmaru.Containers.TestSupport.ScriptedIncus do
     * `:on_subscribe` - `fn state -> state end`, run when a subscription
       starts, so a test can change the instance between subscribe and read
     * `:image_files` - paths every created instance's image holds
+    * `:session` - `fn instance, body -> script end` for an exec session,
+      where a script is `%{output: [{channel, bytes}], exit: code}` and
+      `echo: true` echoes stdin to channel 1 (0 when interactive) until
+      stdin closes
+    * `:operations` - `%{url => %{done: boolean, exit_code: code}}`
   """
 
   @behaviour Opsmaru.Containers.Native.Backend
@@ -37,7 +42,9 @@ defmodule Opsmaru.Containers.TestSupport.ScriptedIncus do
       on_state: fn _, _, state -> state end,
       on_subscribe: & &1,
       events: [],
-      image_files: []
+      image_files: [],
+      session: fn _, _ -> %{output: [], exit: 0} end,
+      operations: %{}
     }
 
     {:ok, agent} =
@@ -285,6 +292,148 @@ defmodule Opsmaru.Containers.TestSupport.ScriptedIncus do
 
   @impl true
   def close_events(_agent), do: :ok
+
+  # -- Exec sessions -----------------------------------------------------------
+
+  @impl true
+  def exec_session(client, instance, body, _deadline) do
+    report(client, {:exec_session, instance, body})
+    script = get(client, :session).(instance, body)
+    observer = get(client, :observer)
+
+    {:ok, session} =
+      Agent.start(fn ->
+        queues =
+          Enum.reduce(script[:output] || [], %{"0" => [], "1" => [], "2" => []}, fn {ch, bytes},
+                                                                                    q ->
+            Map.update!(q, ch, &(&1 ++ [bytes]))
+          end)
+
+        %{
+          queues: queues,
+          open: script[:echo] == true,
+          echo: script[:echo] == true,
+          echo_to: if(body["interactive"], do: "0", else: "1"),
+          exit: script[:exit] || 0,
+          observer: observer
+        }
+      end)
+
+    {:ok, session}
+  end
+
+  @impl true
+  def session_output(session, channel, timeout) do
+    case Agent.get_and_update(session, &take_output(&1, channel)) do
+      :wait when timeout <= 10 ->
+        :timeout
+
+      :wait ->
+        Process.sleep(10)
+        session_output(session, channel, timeout - 10)
+
+      result ->
+        result
+    end
+  end
+
+  defp take_output(state, channel) do
+    case state.queues[channel] do
+      [bytes | rest] -> {{:ok, bytes}, put_in(state.queues[channel], rest)}
+      [] -> {if(state.open, do: :wait, else: :eof), state}
+    end
+  end
+
+  @impl true
+  def session_input(session, bytes) do
+    Agent.update(session, fn state ->
+      send(state.observer, {:incus, {:session_input, bytes}})
+      if state.echo, do: update_in(state.queues[state.echo_to], &(&1 ++ [bytes])), else: state
+    end)
+  end
+
+  @impl true
+  def session_close_input(session) do
+    Agent.update(session, fn state ->
+      send(state.observer, {:incus, :session_close_input})
+      %{state | open: false}
+    end)
+  end
+
+  @impl true
+  def session_resize(session, width, height) do
+    Agent.get(session, fn state ->
+      send(state.observer, {:incus, {:session_resize, width, height}})
+    end)
+
+    :ok
+  end
+
+  @impl true
+  def session_exit(session, _deadline), do: {:ok, Agent.get(session, & &1.exit)}
+
+  @impl true
+  def session_close(session) do
+    if Process.alive?(session) do
+      Agent.get(session, fn state -> send(state.observer, {:incus, :session_close}) end)
+      Agent.stop(session)
+    end
+
+    :ok
+  end
+
+  @impl true
+  def exec_detached(client, instance, body, _deadline) do
+    report(client, {:exec_detached, instance, body})
+    {:ok, "/1.0/operations/detached-" <> instance}
+  end
+
+  @impl true
+  def operation_result(client, url, _deadline) do
+    case Map.fetch(get(client, :operations), url) do
+      {:ok, result} -> {:ok, result}
+      :error -> {:error, :not_found}
+    end
+  end
+
+  # -- SFTP --------------------------------------------------------------------
+
+  @impl true
+  def sftp_open(client, instance, _deadline) do
+    report(client, {:sftp_open, instance})
+    {:ok, {client, instance}}
+  end
+
+  @impl true
+  def sftp_list({client, instance}, dir) do
+    entries =
+      for {{^instance, path}, content} <- get(client, :files),
+          is_binary(content),
+          Path.dirname(path) == dir,
+          do: %{name: Path.basename(path), size: byte_size(content)}
+
+    {:ok, Enum.sort_by(entries, & &1.name)}
+  end
+
+  @impl true
+  def sftp_read({client, instance}, path, offset, count) do
+    case Map.get(get(client, :files), {instance, path}) do
+      content when is_binary(content) and offset <= byte_size(content) ->
+        {:ok, binary_part(content, offset, min(count, byte_size(content) - offset))}
+
+      content when is_binary(content) ->
+        {:ok, ""}
+
+      _ ->
+        {:error, :not_found}
+    end
+  end
+
+  @impl true
+  def sftp_close({client, instance}) do
+    report(client, {:sftp_close, instance})
+    :ok
+  end
 
   defp get(%Incus{server: agent}, key), do: Agent.get(agent, &Map.fetch!(&1, key))
 

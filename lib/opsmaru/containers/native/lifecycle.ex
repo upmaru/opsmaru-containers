@@ -625,7 +625,8 @@ defmodule Opsmaru.Containers.Native.Lifecycle do
     end
   end
 
-  defp patch(native, container, config, deadline) do
+  @doc false
+  def patch(native, container, config, deadline) do
     case native.backend.patch_config(native.client, container.instance, config, deadline) do
       :ok -> :ok
       {:error, :not_found} -> {:error, 404, "No such container: #{container.id}"}

@@ -104,7 +104,10 @@ defmodule Opsmaru.Containers.Native.WaitTest do
     end)
 
     task = Task.async(fn -> call(context, "/containers/job/wait?condition=removed") end)
-    Process.sleep(50)
+
+    # The exit happens only after the wait subscribed and read the running run.
+    assert_receive {:incus, :subscribe}, 2_000
+    assert_receive {:incus, {:read_file, @job_instance, @record}}, 2_000
 
     ScriptedIncus.update(native, fn state ->
       state

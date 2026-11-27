@@ -47,6 +47,31 @@ defmodule Opsmaru.Containers.Native.Backend do
   @doc "The next event (`{:ok, map}`), `:timeout`, or an error once the stream is gone."
   @callback next_event(term(), non_neg_integer()) :: {:ok, map()} | :timeout | {:error, term()}
   @callback close_events(term()) :: :ok
+
+  @doc "Starts an Incus exec with open channels, owned by the calling process."
+  @callback exec_session(Incus.t(), String.t(), map(), deadline()) :: result(term())
+  @doc "The next bytes on a channel, `:timeout` while it stays open, or `:eof`."
+  @callback session_output(term(), String.t(), pos_integer()) ::
+              {:ok, binary()} | :timeout | :eof | {:error, term()}
+  @callback session_input(term(), binary()) :: :ok | {:error, term()}
+  @callback session_close_input(term()) :: :ok | {:error, term()}
+  @callback session_resize(term(), pos_integer(), pos_integer()) :: :ok | {:error, term()}
+  @doc "The exec's exit status, once Incus reports the operation complete."
+  @callback session_exit(term(), deadline()) :: result(integer())
+  @callback session_close(term()) :: :ok
+  @doc "Starts an Incus exec without channels and returns its operation URL."
+  @callback exec_detached(Incus.t(), String.t(), map(), deadline()) :: result(String.t())
+  @doc "Whether a detached exec's operation finished, and its exit status."
+  @callback operation_result(Incus.t(), String.t(), deadline()) ::
+              result(%{done: boolean(), exit_code: integer() | nil})
+  @doc "Opens an SFTP session on an instance, owned by the calling process."
+  @callback sftp_open(Incus.t(), String.t(), deadline()) :: result(term())
+  @doc "A directory's entries; a missing directory has none."
+  @callback sftp_list(term(), Path.t()) ::
+              result([%{name: String.t(), size: non_neg_integer()}])
+  @doc "Up to `count` bytes of a file from `offset`; fewer at its end."
+  @callback sftp_read(term(), Path.t(), non_neg_integer(), pos_integer()) :: result(binary())
+  @callback sftp_close(term()) :: :ok
 end
 
 defmodule Opsmaru.Containers.Native.Incus do
@@ -64,7 +89,8 @@ defmodule Opsmaru.Containers.Native.Incus do
     Operation,
     RequestContext,
     Response,
-    Session
+    Session,
+    SFTP
   }
 
   @max_exec_output 1_048_576
@@ -302,6 +328,121 @@ defmodule Opsmaru.Containers.Native.Incus do
   @impl true
   def close_events(channel) do
     Events.close(channel)
+    :ok
+  end
+
+  @impl true
+  def exec_session(client, instance, body, deadline) do
+    with {:ok, client} <- scope(client, deadline),
+         do: Session.exec(client, instance, body)
+  end
+
+  @impl true
+  def session_output(session, channel, timeout) do
+    case Session.output(session, channel, timeout) do
+      {:ok, {:binary, data}} -> {:ok, data}
+      {:ok, _frame} -> {:ok, ""}
+      :eof -> :eof
+      {:error, %Error{kind: kind}} when kind in [:deadline, :timeout] -> :timeout
+      {:error, _} = error -> error
+    end
+  end
+
+  @impl true
+  def session_input(session, bytes), do: ok(Session.input(session, bytes))
+
+  @impl true
+  def session_close_input(session), do: ok(Session.close_input(session))
+
+  @impl true
+  def session_resize(session, width, height), do: ok(Session.resize(session, width, height))
+
+  @impl true
+  def session_exit(session, deadline) do
+    case Session.exit_status(session) do
+      {:ok, status} ->
+        {:ok, status}
+
+      {:error, %Error{kind: :operation_pending}} = pending ->
+        if remaining(deadline) > 50 do
+          Process.sleep(50)
+          session_exit(session, deadline)
+        else
+          pending
+        end
+
+      {:error, _} = error ->
+        error
+    end
+  end
+
+  @impl true
+  def session_close(session) do
+    Session.close(session)
+    :ok
+  end
+
+  @impl true
+  def exec_detached(client, instance, body, deadline) do
+    body = Map.merge(body, %{"wait-for-websocket" => false, "interactive" => false})
+
+    with {:ok, client} <- scope(client, deadline),
+         {:ok, response} <-
+           Incus.call(client, "ExecInstance", %{"instanceName" => instance}, body: body),
+         {:ok, operation} <- Operation.from_response(client, response) do
+      {:ok, operation.url}
+    end
+  end
+
+  @impl true
+  def operation_result(client, url, deadline) do
+    with {:ok, client} <- scope(client, deadline) do
+      case Operation.poll(%Operation{client: client, url: url}) do
+        {:ok, current} ->
+          code = get_in(Operation.data(current), ["metadata", "return"])
+          {:ok, %{done: Operation.completed?(current), exit_code: if(is_integer(code), do: code)}}
+
+        {:error, %Error{http_status: 404}} ->
+          {:error, :not_found}
+
+        {:error, _} = error ->
+          error
+      end
+    end
+  end
+
+  @impl true
+  def sftp_open(client, instance, deadline) do
+    with {:ok, client} <- scope(client, deadline), do: SFTP.instance(client, instance)
+  end
+
+  @impl true
+  def sftp_list(session, dir) do
+    case SFTP.read_dir(session, dir) do
+      {:ok, entries} -> {:ok, Enum.map(entries, &%{name: &1.name, size: &1.size})}
+      {:error, %Error{response: %{class: :not_exist}}} -> {:ok, []}
+      {:error, _} = error -> error
+    end
+  end
+
+  @impl true
+  def sftp_read(session, path, offset, count) do
+    with {:ok, file} <- SFTP.open(session, path) do
+      try do
+        case SFTP.File.read_at(file, offset, count) do
+          {:ok, data} -> {:ok, data}
+          {:eof, data} -> {:ok, data}
+          {:error, _} = error -> error
+        end
+      after
+        SFTP.File.close(file)
+      end
+    end
+  end
+
+  @impl true
+  def sftp_close(session) do
+    SFTP.close(session)
     :ok
   end
 

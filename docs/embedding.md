@@ -274,9 +274,11 @@ Events never carry:
 ## Route containers to the native engine
 
 The native engine is in development. Create, start, stop, kill, restart,
-pause, unpause, rename, remove, inspect and wait are served for native
-containers. Logs, attach and exec answer a 501 naming the native engine until
-they land. The host contract below is in place and checked.
+pause, unpause, rename, remove, inspect, wait, logs, output-only attach and
+exec are served for native containers. Attach and attached exec need the raw
+handoff, as they do for nested containers; the library serves them from a
+stream of its own, so the host's listener code is unchanged. Stdin attach is
+refused. The host contract below is in place and checked.
 
 - **Target:** build `Opsmaru.Containers.Native.Target.new/2` from a client
   for the native project and the shim binaries (see

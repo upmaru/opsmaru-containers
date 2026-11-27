@@ -272,7 +272,9 @@ Docker's exec user defaults to the container's user. Exec channels are as the sp
 - **Without TTY:** stdout and stderr arrive on separate Incus channels. The library frames them as Docker's multiplexed raw stream. Client write EOF closes Incus stdin, and output keeps flowing until both channels end.
 - **With TTY:** the stream is unframed, and `POST /exec/{id}/resize` maps to the Incus control channel.
 - **Detached** (`Detach: true`): the exec runs without attached channels.
-- **Afterwards:** the exit code is written back to the exec record, so `GET /exec/{id}/json` reports `Running` and `ExitCode`. Exec records older than the newest 32 on an instance are deleted when a new one is created.
+- **Afterwards:** the exit code is written back to the exec record, so `GET /exec/{id}/json` reports `Running` and `ExitCode`. For an attached exec it is written before the stream ends, because the Docker CLI inspects the exec as soon as its output ends. A detached exec's code is read from its Incus operation when the exec is inspected. Exec records older than the newest 32 on an instance are deleted when a new one is created.
+
+An attached exec start goes through the raw adapter. The library serves it from a `Transport.Stream` of its own, so the existing tunnel relays it with half-close as it relays a nested engine's stream. One process per exchange owns the Incus session and stops when the relay owner exits. While the exec runs, that process is registered under `:global` by exec ID, so `POST /exec/{id}/resize` on another connection reaches it. The Plug serves create, inspect, resize and detached start, and answers an attached start with the 501 it already gives nested engines.
 
 ### 10. Native identity lives on the Incus instance
 
@@ -390,7 +392,9 @@ As dockerd does, the status line and headers are sent before the wait begins, an
 2. When the start has returned, it reopens a session, retrying while a short-lived process is already stopping, and follows from the position.
 3. It answers once that run's exit record exists and the instance has stopped.
 
-The spike ran this three times with a command that printed two lines and exited at once. Both lines arrived every time, and the attach ended 0.3–0.6 s after the start returned. Stdin attach is refused (non-goal).
+The spike ran this three times with a command that printed two lines and exited at once. Both lines arrived every time, and the attach ended 0.3–0.6 s after the start returned. Stdin attach is refused (non-goal), as are `logs=1` and an attach without `stream=1`.
+
+The attach is served through the raw adapter by the same library-owned stream as attached exec. It polls the instance every 100 ms and opens an SFTP session only while the instance runs. A run that starts and exits between two polls is still delivered, by the final read after the stop. The logs route sends its status line with the first record, so a malformed log found before any output is answered with a 500 naming the native engine.
 
 ### 15. Route table and evidence
 
@@ -415,6 +419,8 @@ Evidence for a native route needs:
 - **[Double image storage]** → Every image a native container uses is stored in dockerd and in Incus. `prune_images/2` bounds it. Handoff of a large image takes tens of seconds on first use.
 - **[Two engines, one namespace]** → Names and ID prefixes must stay unique across engines. Host-serialized creates make that safe for one host. Two hosts on one target need the same serialization they already need for lifecycle mutations.
 - **[Translation drift]** → A new Docker release can add create fields. The table check fails on unknown fields, and unknown non-default values are refused.
+- **[Detached exec exit codes]** → A detached exec's exit code lives in its Incus operation until the exec is inspected. Incus keeps finished operations only briefly, so an inspect after that reports `Running: false` with no `ExitCode`. Attached execs, which is what `docker exec` without `-d` uses, are not affected.
+- **[Exec resize across nodes]** → A running attached exec is found for resize through `:global`. Hosts that run the library on several connected nodes get that for free; unconnected nodes behind one listener do not, and resize then answers 409.
 - **[Incus key limits]** → `oci.*` keys are not live-updatable, so `docker update` stays refused for native containers.
 - **[Larger trust boundary for the host]** → Native containers are full Incus instances in a host-chosen project. The host's authorization and its project configuration (profiles, limits, network, root size) bound what a Docker client can create there.
 
